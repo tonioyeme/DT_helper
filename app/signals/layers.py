@@ -225,12 +225,13 @@ class IndicatorLayers:
         if layer_name in self.layers:
             self.layers[layer_name].weight = weight
             
-    def aggregate_signals(self, results: Dict[str, Dict[str, Dict[str, Any]]]) -> Dict[str, Any]:
+    def aggregate_signals(self, results: Dict[str, Dict[str, Dict[str, Any]]], weight_adjustment: Callable[[float], float] = None) -> Dict[str, Any]:
         """
         Aggregate signals from all layers and indicators
         
         Args:
             results: Results from calculate_all method
+            weight_adjustment: Optional callable that can adjust weights based on market regime or other factors
             
         Returns:
             Dictionary with aggregated signals
@@ -245,6 +246,11 @@ class IndicatorLayers:
                 continue
                 
             layer_weight = self.layers[layer_name].weight
+            
+            # Apply weight adjustment if provided
+            if weight_adjustment is not None:
+                layer_weight = weight_adjustment(layer_weight)
+                
             layer_results = results[layer_name]
             
             # Process indicators in this layer
@@ -283,7 +289,8 @@ class IndicatorLayers:
         sell_score = sum(s['effective_weight'] for s in sell_signals) if sell_signals else 0
         
         # Normalize if we have any signals
-        total_weight = sum(layer.weight for layer in self.layers.values())
+        total_weight = sum(layer.weight if weight_adjustment is None else weight_adjustment(layer.weight) 
+                          for layer in self.layers.values())
         if total_weight > 0:
             buy_score = (buy_score / total_weight) * 10  # Scale to 0-10
             sell_score = (sell_score / total_weight) * 10  # Scale to 0-10

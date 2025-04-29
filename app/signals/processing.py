@@ -4,21 +4,19 @@ from enum import Enum
 from typing import Dict, List, Optional, Tuple, Union, Any
 import logging
 
+# Import from scoring.py to ensure we're using the same enums
+from app.signals.scoring import MarketRegime, SignalStrength
+
+# These enum classes are now imported from scoring.py
+"""
 class MarketRegime(Enum):
-    """Market regime classifications"""
     BULL_TREND = "bull_trend"       # Strong uptrend
     BEAR_TREND = "bear_trend"       # Strong downtrend
     SIDEWAYS = "sideways"           # Sideways/choppy market
     HIGH_VOLATILITY = "high_volatility"  # High volatility period
     LOW_VOLATILITY = "low_volatility"    # Low volatility period
     REVERSAL = "reversal"           # Potential trend reversal
-
-class SignalStrength(Enum):
-    """Signal strength classifications"""
-    WEAK = 1      # Low confidence
-    MODERATE = 2  # Moderate confidence
-    STRONG = 3    # Strong confidence
-    VERY_STRONG = 4  # Very strong confidence
+"""
 
 class AdvancedSignalProcessor:
     """

@@ -19,14 +19,13 @@ from app.indicators import (
     calculate_pain,
     calculate_ema_vwap_strategy,
     calculate_measured_move_volume_strategy,
-    multi_indicator_confirmation
+    multi_indicator_confirmation,
+    calculate_roc, 
+    calculate_hull_moving_average, 
+    calculate_ttm_squeeze,
+    detect_hidden_divergence
 )
 from app.patterns import (
-    identify_doji,
-    identify_hammer,
-    identify_engulfing,
-    identify_morning_star,
-    identify_evening_star,
     # New price action patterns
     identify_head_and_shoulders,
     identify_inverse_head_and_shoulders,
@@ -55,13 +54,14 @@ from app.signals.timeframes import (
     create_standard_timeframes
 )
 
+# Import signals and market regime
 from app.signals.scoring import (
-    DynamicSignalScorer, SignalStrength, MarketRegime
+    DynamicSignalScorer, MarketRegime, SignalStrength
 )
 
 from app.signals.processing import (
     AdvancedSignalProcessor, calculate_advanced_signal_score,
-    calculate_multi_timeframe_signal_score, MarketRegime, SignalStrength
+    calculate_multi_timeframe_signal_score
 )
 
 class SignalGenerator:
@@ -229,11 +229,55 @@ class SignalGenerator:
         # Calculate indicators using the layered system
         indicator_results = self.indicator_layers.calculate_all(data)
         
-        # Aggregate signals from all layers
-        aggregated_signals = self.indicator_layers.aggregate_signals(indicator_results)
-        
-        # Detect market regime for the signal scorer
+        # Detect market regime for the signal scorer before aggregating signals
         market_regime = self.signal_scorer.detect_market_regime(data)
+        
+        # Define regime-based weights
+        regime_weights = {
+            MarketRegime.BULL_TREND: 1.3,
+            MarketRegime.BEAR_TREND: 1.2,
+            MarketRegime.SIDEWAYS: 0.8,
+            MarketRegime.HIGH_VOLATILITY: 0.7
+        }
+        
+        # Define a weight adjustment function based on current market regime
+        def weight_adjustment(weight):
+            return weight * regime_weights.get(market_regime, 1.0)
+        
+        # Define time decay function (0.95 per hour)
+        def apply_time_decay(signals_data):
+            if not isinstance(signals_data, dict) or not isinstance(data.index, pd.DatetimeIndex):
+                return signals_data
+                
+            try:
+                # Calculate time decay based on most recent timestamp
+                latest_time = data.index[-1]
+                time_delta = (latest_time - data.index).total_seconds() / 3600
+                
+                # Apply time decay to signals
+                # This is a simplified approach - in a real implementation, you'd apply this
+                # to actual signal scores within the aggregation logic
+                if 'buy_score' in signals_data:
+                    signals_data['buy_score'] = signals_data.get('buy_score', 0) * (0.95 ** max(0, time_delta[-1]))
+                if 'sell_score' in signals_data:
+                    signals_data['sell_score'] = signals_data.get('sell_score', 0) * (0.95 ** max(0, time_delta[-1]))
+            except Exception:
+                # If time decay calculation fails, just return original signals
+                pass
+                
+            return signals_data
+        
+        # Aggregate signals with weight adjustment for market regime
+        aggregated_signals = self.indicator_layers.aggregate_signals(
+            indicator_results,
+            weight_adjustment=weight_adjustment
+        )
+        
+        # Apply time decay to aggregated signals
+        aggregated_signals = apply_time_decay(aggregated_signals)
+        
+        # Add market regime information to signals
+        aggregated_signals['market_regime'] = market_regime
         
         # Score the signals using dynamic scoring
         scored_signals = self.signal_scorer.score_signal(
@@ -268,8 +312,28 @@ class SignalGenerator:
             self.logger.error("No primary timeframe set")
             return {"error": "No primary timeframe set"}
             
-        # Process multi-timeframe validation
-        multi_tf_signals = self.timeframe_manager.analyze_multi_timeframe_signals()
+        # Detect market regime using primary timeframe data
+        market_regime = None
+        if primary_tf in self.timeframe_manager.timeframes:
+            primary_data = self.timeframe_manager.timeframes[primary_tf].data
+            if primary_data is not None and len(primary_data) > 30:
+                try:
+                    # Use advanced signal processor to detect market regime
+                    processor = AdvancedSignalProcessor()
+                    market_regime = processor.detect_market_regime(primary_data)
+                    self.logger.info(f"Detected market regime: {market_regime}")
+                except Exception as e:
+                    self.logger.error(f"Error detecting market regime: {str(e)}")
+        
+        # Process multi-timeframe validation using enhanced method if available
+        try:
+            # Use the enhanced multi-timeframe analysis with market regime information
+            multi_tf_signals = self.timeframe_manager.enhanced_multi_timeframe_analysis(market_regime)
+            self.logger.info(f"Generated enhanced multi-timeframe signals with regime adjustment")
+        except (AttributeError, Exception) as e:
+            # Fall back to basic multi-timeframe analysis if enhanced method isn't available
+            self.logger.warning(f"Enhanced multi-timeframe analysis failed, using basic method: {str(e)}")
+            multi_tf_signals = self.timeframe_manager.analyze_multi_timeframe_signals()
         
         # Add context
         if "error" not in multi_tf_signals:
@@ -298,6 +362,11 @@ class SignalGenerator:
                             }
                             
                         multi_tf_signals['indicator_signals'][layer_name] = layer_results
+            
+            # Add market regime information if available
+            if market_regime:
+                multi_tf_signals['market_regime'] = market_regime.value
+                multi_tf_signals['market_regime_name'] = market_regime.name
         
         return multi_tf_signals
         
@@ -410,527 +479,143 @@ def is_market_hours(timestamp):
 
 def generate_signals(data):
     """
-    Generate trading signals based on various indicators and patterns
+    Generate trading signals based on various indicators
     
     Args:
-        data (pd.DataFrame): DataFrame with OHLC and volume data
-        
+        data (pd.DataFrame): DataFrame with OHLCV data
+    
     Returns:
-        pd.DataFrame: DataFrame with buy/sell signals and strength
+        pd.DataFrame: DataFrame with signal columns
     """
-    if not isinstance(data, pd.DataFrame):
-        raise ValueError("Input must be a DataFrame")
+    # Create a generator instance (this is a quick solution)
+    generator = create_default_signal_generator()
     
-    required_cols = ['open', 'high', 'low', 'close', 'volume']
-    if not all(col in data.columns for col in required_cols):
-        raise ValueError(f"DataFrame must contain these columns: {required_cols}")
+    # Create a data dictionary with a default timeframe
+    data_dict = {"1h": data}  # Using 1h as the default timeframe
     
-    try:
-        # Initialize signals DataFrame - first create a complete frame with default values
+    # Process the data using the generator
+    generator.process_data(data, "1h")
+    
+    # Use the enhanced signal generation to get signals
+    result = generator.generate_signals(data_dict)
+    
+    # If the result is a dictionary with signals, extract it
+    if isinstance(result, dict) and "primary_signals" in result:
+        # Get the signals from the primary timeframe
         signals = pd.DataFrame(index=data.index)
-        signals['buy_signal'] = False
-        signals['sell_signal'] = False
-        signals['signal_strength'] = 0
-        signals['target_price'] = np.nan
-        signals['stop_loss'] = np.nan
-        signals['signal_price'] = np.nan  # Add price at which signal was generated
         
-        # Convert timestamps to Eastern Time
+        # Copy over the signals data
+        for key, value in result["primary_signals"].items():
+            # Skip nested dictionaries or complex objects
+            if not isinstance(value, (dict, list, tuple, pd.DataFrame, pd.Series)) and not callable(value):
+                signals[key] = value
+                
+        # Ensure basic signal columns exist
+        if "buy_signal" not in signals.columns:
+            signals["buy_signal"] = False
+        if "sell_signal" not in signals.columns:
+            signals["sell_signal"] = False
+        if "signal_strength" not in signals.columns:
+            signals["signal_strength"] = 0
+            
+        # Set price and time information
+        signals["signal_price"] = data["close"]
         eastern = pytz.timezone('US/Eastern')
-        signals['signal_time_et'] = [idx.astimezone(eastern).strftime('%Y-%m-%d %H:%M:%S') if hasattr(idx, 'astimezone') else idx 
-                                     for idx in signals.index]
-        
-        # Get market hours mask - only calculate signals during market hours
-        market_hours_mask = pd.Series([is_market_hours(idx) for idx in data.index], index=data.index)
-        data_market_hours = data[market_hours_mask]
-        
-        # If no market hours data, return the empty signals DataFrame
-        if len(data_market_hours) == 0:
-            print("No data points during market hours, skipping signal calculation")
-            return signals
+        signals["signal_time_et"] = [idx.astimezone(eastern).strftime('%Y-%m-%d %H:%M:%S') if hasattr(idx, 'astimezone') else str(idx) 
+                                  for idx in signals.index]
+                                  
+        # Set signal scores if available
+        if "buy_strength" in result["primary_signals"]:
+            signals["buy_score"] = result["primary_signals"]["buy_strength"]
+        if "sell_strength" in result["primary_signals"]:
+            signals["sell_score"] = result["primary_signals"]["sell_strength"]
             
-        # Calculate volume ratio - vectorized approach
-        signals['volume_ratio'] = 1.0  # Initialize with default value
-        try:
-            # Ensure volume is positive and non-zero
-            volume_sma = data['volume'].replace(0, np.nan).rolling(window=20, min_periods=1).mean()
-            # Calculate ratio only for non-zero SMA using vectorized operations
-            mask = volume_sma > 0
-            if mask.any():
-                signals.loc[mask, 'volume_ratio'] = data.loc[mask, 'volume'] / volume_sma[mask]
-        except Exception as e:
-            print(f"Error calculating volume ratio: {str(e)}")
-        
-        # Initialize strategy signal columns
-        signals['ema_vwap_bullish'] = False
-        signals['ema_vwap_bearish'] = False
-        signals['mm_vol_bullish'] = False
-        signals['mm_vol_bearish'] = False
-        
-        # Calculate indicators for all data points
-        ema20 = calculate_ema(data, 20)
-        ema50 = calculate_ema(data, 50)
-        ema200 = calculate_ema(data, 200)
-        fast_ema, slow_ema = calculate_ema_cloud(data, 20, 50)
-        macd_line, signal_line, macd_hist = calculate_macd(data)
-        vwap = calculate_vwap(data)
-        obv = calculate_obv(data)
-        ad_line = calculate_ad_line(data)
-        rsi = calculate_rsi(data)
-        stoch_k, stoch_d = calculate_stochastic(data)
-        sma5, sma8, sma13 = calculate_fibonacci_sma(data)
-        intraday_momentum, late_selling, late_buying = calculate_pain(data)
-        
-        # Calculate new strategies
-        ema_vwap_bullish, ema_vwap_bearish, ema_vwap_targets, ema_vwap_stops = calculate_ema_vwap_strategy(data)
-        mm_vol_bullish, mm_vol_bearish, mm_vol_targets, mm_vol_stops = calculate_measured_move_volume_strategy(data)
-        
-        # Identify patterns
-        doji = identify_doji(data)
-        hammer = identify_hammer(data)
-        bullish_engulfing, bearish_engulfing = identify_engulfing(data)
-        morning_star = identify_morning_star(data)
-        evening_star = identify_evening_star(data)
-        
-        # Identify price action patterns
-        head_and_shoulders = identify_head_and_shoulders(data)
-        inverse_head_and_shoulders = identify_inverse_head_and_shoulders(data)
-        double_top = identify_double_top(data)
-        double_bottom = identify_double_bottom(data)
-        triple_top = identify_triple_top(data)
-        triple_bottom = identify_triple_bottom(data)
-        bullish_rectangle, bearish_rectangle = identify_rectangle(data)
-        ascending_channel, descending_channel = identify_channel(data)
-        ascending_triangle, descending_triangle, symmetric_triangle = identify_triangle(data)
-        bull_flag, bear_flag = identify_flag(data)
-        
-        # Compute signals using vectorized operations
-        # Only apply to market hours data
-        market_idx = data.index[market_hours_mask]
-        
-        # Set signal prices for all market hours points
-        signals.loc[market_idx, 'signal_price'] = data.loc[market_idx, 'close']
-        
-        # Initialize new signal scoring columns
-        signals['buy_score'] = 0.0
-        signals['sell_score'] = 0.0
-        
-        # ---------- WEIGHTED SCORING SYSTEM IMPLEMENTATION ----------
-        
-        # Define weights for different indicators based on their predictive power
-        # These weights should be calibrated based on backtesting results
-        indicator_weights = {
-            # Trend indicators
-            'price_above_ema20': 0.15,
-            'price_above_ema50': 0.20,
-            'price_above_ema200': 0.25,
-            'price_above_vwap': 0.15,
-            'ema_cloud_bullish': 0.20,
-            
-            # Momentum indicators
-            'macd_cross_above_signal': 0.25,
-            'macd_cross_below_signal': 0.25,
-            'macd_above_zero': 0.15,
-            'macd_below_zero': 0.15,
-            'rsi_oversold': 0.20,
-            'rsi_overbought': 0.20,
-            
-            # Volume indicators
-            'obv_increasing': 0.20,
-            'obv_decreasing': 0.20,
-            'ad_line_increasing': 0.15,
-            'ad_line_decreasing': 0.15,
-            'volume_ratio_high': 0.25,
-            
-            # Pattern indicators
-            'bullish_engulfing': 0.30,
-            'bearish_engulfing': 0.30,
-            'hammer': 0.25,
-            'doji': 0.15,
-            'morning_star': 0.35,
-            'evening_star': 0.35,
-            
-            # Strategy indicators
-            'ema_vwap_bullish': 0.40,
-            'ema_vwap_bearish': 0.40,
-            'mm_vol_bullish': 0.35,
-            'mm_vol_bearish': 0.35,
-            
-            # Price action patterns
-            'inverse_head_shoulders': 0.30,
-            'head_shoulders': 0.30,
-            'double_bottom': 0.25,
-            'double_top': 0.25,
-            'bullish_rectangle': 0.20,
-            'bearish_rectangle': 0.20,
-            'bull_flag': 0.25,
-            'bear_flag': 0.25
-        }
-        
-        # Detect market conditions
-        # Calculate volatility using ATR or recent price range
-        if len(data) >= 14:
-            # Calculate ATR
-            high_low = data['high'] - data['low']
-            high_close = abs(data['high'] - data['close'].shift(1))
-            low_close = abs(data['low'] - data['close'].shift(1))
-            tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-            atr = tr.rolling(window=14).mean()
-            
-            # Calculate volatility as percentage of price
-            volatility = atr / data['close']
-            high_volatility = volatility > volatility.rolling(window=30).mean() * 1.5
-            
-            # Determine trend strength using ADX or moving average slopes
-            ma_short = data['close'].rolling(window=20).mean()
-            ma_long = data['close'].rolling(window=50).mean()
-            
-            uptrend = ma_short > ma_long
-            downtrend = ma_short < ma_long
-            
-            # Adjust weights based on market conditions
-            for idx in market_idx:
-                # Adjust for high volatility
-                volatility_factor = 1.0
-                if len(volatility) > 0 and idx in volatility.index and not pd.isna(volatility[idx]):
-                    if high_volatility[idx]:
-                        # In high volatility, increase weight of trend indicators, decrease oscillators
-                        volatility_factor = 1.5
-                    else:
-                        # In low volatility, do the opposite
-                        volatility_factor = 0.8
+        # Generate some dummy target and stop loss values
+        for idx in signals.index:
+            if signals.loc[idx, "buy_signal"]:
+                signals.loc[idx, "target_price"] = data.loc[idx, "close"] * 1.02
+                signals.loc[idx, "stop_loss"] = data.loc[idx, "close"] * 0.98
+            elif signals.loc[idx, "sell_signal"]:
+                signals.loc[idx, "target_price"] = data.loc[idx, "close"] * 0.98
+                signals.loc[idx, "stop_loss"] = data.loc[idx, "close"] * 1.02
                 
-                # Calculate RSI values
-                rsi_value = rsi[idx] if idx in rsi.index else 50
-                
-                # Price above/below EMAs (vectorized)
-                signals.loc[idx, 'price_above_ema20'] = data.loc[idx, 'close'] > ema20.loc[idx]
-                signals.loc[idx, 'price_above_ema50'] = data.loc[idx, 'close'] > ema50.loc[idx]
-                signals.loc[idx, 'price_above_ema200'] = data.loc[idx, 'close'] > ema200.loc[idx]
-                signals.loc[idx, 'price_above_vwap'] = data.loc[idx, 'close'] > vwap.loc[idx]
-                
-                # EMA cloud signals
-                signals.loc[idx, 'ema_cloud_bullish'] = fast_ema.loc[idx] > slow_ema.loc[idx]
-                
-                # RSI signals
-                signals.loc[idx, 'rsi_oversold'] = rsi_value < 30
-                signals.loc[idx, 'rsi_overbought'] = rsi_value > 70
-                
-                # MACD signals
-                signals.loc[idx, 'macd_above_zero'] = macd_line.loc[idx] > 0
-                signals.loc[idx, 'macd_below_zero'] = macd_line.loc[idx] < 0
-                
-                # Volume signals
-                signals.loc[idx, 'volume_ratio_high'] = signals.loc[idx, 'volume_ratio'] > 1.2
+        # Try to generate buy/sell counts for visualization
+        signals["buy_count"] = 0
+        signals["sell_count"] = 0
         
-        # Handle crossover signals (requires accessing previous values)
-        for i, idx in enumerate(market_idx):
-            if i > 0:
-                prev_idx = market_idx[i-1]
-                
-                # Price crossovers
-                signals.loc[idx, 'price_cross_above_ema20'] = (data.loc[idx, 'close'] > ema20.loc[idx]) & (data.loc[prev_idx, 'close'] <= ema20.loc[prev_idx])
-                signals.loc[idx, 'price_cross_below_ema20'] = (data.loc[idx, 'close'] < ema20.loc[idx]) & (data.loc[prev_idx, 'close'] >= ema20.loc[prev_idx])
-                
-                # EMA cloud crossovers
-                signals.loc[idx, 'ema_cloud_cross_bullish'] = (fast_ema.loc[idx] > slow_ema.loc[idx]) & (fast_ema.loc[prev_idx] <= slow_ema.loc[prev_idx])
-                signals.loc[idx, 'ema_cloud_cross_bearish'] = (fast_ema.loc[idx] < slow_ema.loc[idx]) & (fast_ema.loc[prev_idx] >= slow_ema.loc[prev_idx])
-                
-                # MACD crossovers
-                signals.loc[idx, 'macd_cross_above_signal'] = (macd_line.loc[idx] > signal_line.loc[idx]) & (macd_line.loc[prev_idx] <= signal_line.loc[prev_idx])
-                signals.loc[idx, 'macd_cross_below_signal'] = (macd_line.loc[idx] < signal_line.loc[idx]) & (macd_line.loc[prev_idx] >= signal_line.loc[prev_idx])
-                
-                # VWAP crossovers
-                signals.loc[idx, 'price_cross_above_vwap'] = (data.loc[idx, 'close'] > vwap.loc[idx]) & (data.loc[prev_idx, 'close'] <= vwap.loc[prev_idx])
-                signals.loc[idx, 'price_cross_below_vwap'] = (data.loc[idx, 'close'] < vwap.loc[idx]) & (data.loc[prev_idx, 'close'] >= vwap.loc[prev_idx])
-                
-                # OBV and A/D line changes
-                signals.loc[idx, 'obv_increasing'] = obv.loc[idx] > obv.loc[prev_idx]
-                signals.loc[idx, 'obv_decreasing'] = obv.loc[idx] < obv.loc[prev_idx]
-                signals.loc[idx, 'ad_line_increasing'] = ad_line.loc[idx] > ad_line.loc[prev_idx]
-                signals.loc[idx, 'ad_line_decreasing'] = ad_line.loc[idx] < ad_line.loc[prev_idx]
-                
-                # Divergence patterns (3-day lookback)
-                if i >= 3:
-                    idx_minus_3 = market_idx[i-3]
-                    signals.loc[idx, 'bullish_price_obv_divergence'] = (data.loc[idx, 'close'] < data.loc[idx_minus_3, 'close']) & (obv.loc[idx] > obv.loc[idx_minus_3])
-                    signals.loc[idx, 'bearish_price_obv_divergence'] = (data.loc[idx, 'close'] > data.loc[idx_minus_3, 'close']) & (obv.loc[idx] < obv.loc[idx_minus_3])
+        # Initialize confirmation count columns
+        signals["buy_confirm_count"] = 0
+        signals["sell_confirm_count"] = 0
         
-        # Copy pattern signals
-        for idx in market_idx:
-            if idx in bullish_engulfing.index:
-                signals.loc[idx, 'bullish_engulfing'] = bullish_engulfing.loc[idx]
-            if idx in bearish_engulfing.index:
-                signals.loc[idx, 'bearish_engulfing'] = bearish_engulfing.loc[idx]
-            if idx in hammer.index:
-                signals.loc[idx, 'hammer'] = hammer.loc[idx]
-            if idx in doji.index:
-                signals.loc[idx, 'doji'] = doji.loc[idx]
-            if idx in morning_star.index:
-                signals.loc[idx, 'morning_star'] = morning_star.loc[idx]
-            if idx in evening_star.index:
-                signals.loc[idx, 'evening_star'] = evening_star.loc[idx]
-            
-            # Price action patterns
-            if idx in inverse_head_and_shoulders.index:
-                signals.loc[idx, 'inverse_head_shoulders'] = inverse_head_and_shoulders.loc[idx]
-            if idx in head_and_shoulders.index:
-                signals.loc[idx, 'head_shoulders'] = head_and_shoulders.loc[idx]
-            if idx in double_bottom.index:
-                signals.loc[idx, 'double_bottom'] = double_bottom.loc[idx]
-            if idx in double_top.index:
-                signals.loc[idx, 'double_top'] = double_top.loc[idx]
-            if idx in bullish_rectangle.index:
-                signals.loc[idx, 'bullish_rectangle'] = bullish_rectangle.loc[idx]
-            if idx in bearish_rectangle.index:
-                signals.loc[idx, 'bearish_rectangle'] = bearish_rectangle.loc[idx]
-            if idx in bull_flag.index:
-                signals.loc[idx, 'bull_flag'] = bull_flag.loc[idx]
-            if idx in bear_flag.index:
-                signals.loc[idx, 'bear_flag'] = bear_flag.loc[idx]
-        
-        # Copy strategy signals (vectorized)
-        common_idx = market_idx.intersection(ema_vwap_bullish.index)
-        if not common_idx.empty:
-            signals.loc[common_idx, 'ema_vwap_bullish'] = ema_vwap_bullish.loc[common_idx]
-            
-        common_idx = market_idx.intersection(ema_vwap_bearish.index)
-        if not common_idx.empty:
-            signals.loc[common_idx, 'ema_vwap_bearish'] = ema_vwap_bearish.loc[common_idx]
-            
-        common_idx = market_idx.intersection(mm_vol_bullish.index)
-        if not common_idx.empty:
-            signals.loc[common_idx, 'mm_vol_bullish'] = mm_vol_bullish.loc[common_idx]
-            
-        common_idx = market_idx.intersection(mm_vol_bearish.index)
-        if not common_idx.empty:
-            signals.loc[common_idx, 'mm_vol_bearish'] = mm_vol_bearish.loc[common_idx]
-        
-        # Calculate scores for buy signals
-        for idx in market_idx:
-            buy_score = 0.0
-            sell_score = 0.0
-            
-            # Dynamically adjust weights based on market conditions
-            trend_multiplier = 1.0
-            reversal_multiplier = 1.0
-            volume_multiplier = 1.0
-            
-            # Check if we have market condition data
-            if 'uptrend' in locals() and idx in uptrend.index:
-                # In strong uptrend, value trend continuations more
-                if uptrend[idx]:
-                    trend_multiplier = 1.2
-                    reversal_multiplier = 0.8
-                # In strong downtrend, value trend continuations more
-                elif downtrend[idx]:
-                    trend_multiplier = 1.2
-                    reversal_multiplier = 0.8
-                    
-            # In high volume periods, value volume indicators more
-            if signals.loc[idx, 'volume_ratio'] > 1.5:
-                volume_multiplier = 1.3
-                
-            # Calculate buy score components
-            for indicator, weight in indicator_weights.items():
-                if indicator in signals.columns and signals.loc[idx, indicator] == True:
-                    # Apply appropriate multiplier based on indicator type
-                    adjusted_weight = weight
-                    
-                    # Trend indicators
-                    if indicator in ['price_above_ema20', 'price_above_ema50', 'price_above_ema200', 
-                                     'price_above_vwap', 'ema_cloud_bullish']:
-                        adjusted_weight *= trend_multiplier
+        if "indicator_signals" in result:
+            for layer_name, layer_data in result["indicator_signals"].items():
+                for indicator_name, indicator_data in layer_data.items():
+                    if indicator_data.get("buy_signal", False):
+                        signals["buy_count"] += 1
+                        signals["buy_confirm_count"] += 1
+                    if indicator_data.get("sell_signal", False):
+                        signals["sell_count"] += 1
+                        signals["sell_confirm_count"] += 1
                         
-                    # Reversal indicators
-                    elif indicator in ['hammer', 'bullish_engulfing', 'morning_star', 'inverse_head_shoulders', 'double_bottom']:
-                        adjusted_weight *= reversal_multiplier
-                        
-                    # Volume indicators
-                    elif indicator in ['obv_increasing', 'ad_line_increasing', 'volume_ratio_high']:
-                        adjusted_weight *= volume_multiplier
-                        
-                    # Add to buy score if it's a bullish indicator
-                    if indicator in ['price_above_ema20', 'price_above_ema50', 'price_above_ema200', 
-                                    'price_above_vwap', 'ema_cloud_bullish', 'macd_cross_above_signal',
-                                    'macd_above_zero', 'rsi_oversold', 'obv_increasing', 'ad_line_increasing',
-                                    'bullish_engulfing', 'hammer', 'morning_star', 'ema_vwap_bullish',
-                                    'mm_vol_bullish', 'inverse_head_shoulders', 'double_bottom',
-                                    'bullish_rectangle', 'bull_flag', 'bullish_price_obv_divergence',
-                                    'price_cross_above_ema20', 'ema_cloud_cross_bullish', 'price_cross_above_vwap']:
-                        buy_score += adjusted_weight
-                    
-                    # Add to sell score if it's a bearish indicator
-                    elif indicator in ['macd_cross_below_signal', 'macd_below_zero', 'rsi_overbought',
-                                      'obv_decreasing', 'ad_line_decreasing', 'bearish_engulfing',
-                                      'evening_star', 'ema_vwap_bearish', 'mm_vol_bearish',
-                                      'head_shoulders', 'double_top', 'bearish_rectangle', 'bear_flag',
-                                      'bearish_price_obv_divergence', 'price_cross_below_ema20',
-                                      'ema_cloud_cross_bearish', 'price_cross_below_vwap']:
-                        sell_score += adjusted_weight
-            
-            # Store calculated scores
-            signals.loc[idx, 'buy_score'] = min(1.0, buy_score)  # Cap at 1.0
-            signals.loc[idx, 'sell_score'] = min(1.0, sell_score)  # Cap at 1.0
-        
-        # Apply thresholds to determine signals
-        # Use dynamic thresholds based on market conditions
-        base_buy_threshold = 0.6
-        base_sell_threshold = 0.6
-        
-        # Adjust thresholds if we have volatility data
-        if 'volatility' in locals():
-            # Use last volatility value or median if not available
-            recent_volatility = volatility.iloc[-1] if len(volatility) > 0 else np.nan
-            median_volatility = volatility.median() if len(volatility) > 0 else np.nan
-            
-            # If recent volatility is high, require stronger signals
-            if not pd.isna(recent_volatility) and not pd.isna(median_volatility):
-                volatility_ratio = recent_volatility / median_volatility
+        # Set signal strength based on confirmation count
+        for idx in signals.index:
+            # Map signal strength based on confirmation count
+            if signals.at[idx, 'buy_confirm_count'] >= 3:
+                signals.at[idx, 'signal_strength'] = SignalStrength.VERY_STRONG.value
+            elif signals.at[idx, 'buy_confirm_count'] >= 2:
+                signals.at[idx, 'signal_strength'] = SignalStrength.STRONG.value
+            elif signals.at[idx, 'buy_confirm_count'] >= 1:
+                signals.at[idx, 'signal_strength'] = SignalStrength.MODERATE.value
+            else:
+                signals.at[idx, 'signal_strength'] = SignalStrength.WEAK.value
                 
-                # Adjust thresholds - higher volatility requires stronger signals
-                if volatility_ratio > 1.5:
-                    base_buy_threshold = 0.75
-                    base_sell_threshold = 0.75
-                elif volatility_ratio < 0.7:
-                    base_buy_threshold = 0.5
-                    base_sell_threshold = 0.5
-        
-        # Generate buy/sell signals using calculated scores
-        signals['buy_signal'] = signals['buy_score'] >= base_buy_threshold
-        signals['sell_signal'] = signals['sell_score'] >= base_sell_threshold
-        
-        # Set buy_count and sell_count for backward compatibility
-        signals['buy_count'] = (signals['buy_score'] * 10).astype(int)
-        signals['sell_count'] = (signals['sell_score'] * 10).astype(int)
-        
-        # Set targets and stop losses - vectorized where possible
-        buy_idx = signals.index[signals['buy_signal']].intersection(market_idx)
-        sell_idx = signals.index[signals['sell_signal']].intersection(market_idx)
-        
-        # Default targets and stops
-        if not buy_idx.empty:
-            signals.loc[buy_idx, 'target_price'] = data.loc[buy_idx, 'close'] * 1.05
-            signals.loc[buy_idx, 'stop_loss'] = data.loc[buy_idx, 'close'] * 0.97
-        
-        if not sell_idx.empty:
-            signals.loc[sell_idx, 'target_price'] = data.loc[sell_idx, 'close'] * 0.95
-            signals.loc[sell_idx, 'stop_loss'] = data.loc[sell_idx, 'close'] * 1.03
-        
-        # Override with strategy-specific targets if available
-        # EMA/VWAP strategy buy signals
-        if not buy_idx.empty:
-            ema_vwap_buy_idx = buy_idx[signals.loc[buy_idx, 'ema_vwap_bullish']]
-            if not ema_vwap_buy_idx.empty:
-                common_idx = ema_vwap_buy_idx.intersection(ema_vwap_targets.index)
-                if not common_idx.empty:
-                    valid_idx = common_idx[~pd.isna(ema_vwap_targets.loc[common_idx])]
-                    if not valid_idx.empty:
-                        signals.loc[valid_idx, 'target_price'] = ema_vwap_targets.loc[valid_idx]
-                        signals.loc[valid_idx, 'stop_loss'] = ema_vwap_stops.loc[valid_idx]
-            
-            # MM/Vol strategy buy signals
-            mm_vol_buy_idx = buy_idx[signals.loc[buy_idx, 'mm_vol_bullish']]
-            if not mm_vol_buy_idx.empty:
-                common_idx = mm_vol_buy_idx.intersection(mm_vol_targets.index)
-                if not common_idx.empty:
-                    valid_idx = common_idx[~pd.isna(mm_vol_targets.loc[common_idx])]
-                    if not valid_idx.empty:
-                        signals.loc[valid_idx, 'target_price'] = mm_vol_targets.loc[valid_idx]
-                        signals.loc[valid_idx, 'stop_loss'] = mm_vol_stops.loc[valid_idx]
-        
-        if not sell_idx.empty:
-            # EMA/VWAP strategy sell signals
-            ema_vwap_sell_idx = sell_idx[signals.loc[sell_idx, 'ema_vwap_bearish']]
-            if not ema_vwap_sell_idx.empty:
-                common_idx = ema_vwap_sell_idx.intersection(ema_vwap_targets.index)
-                if not common_idx.empty:
-                    valid_idx = common_idx[~pd.isna(ema_vwap_targets.loc[common_idx])]
-                    if not valid_idx.empty:
-                        signals.loc[valid_idx, 'target_price'] = ema_vwap_targets.loc[valid_idx]
-                        signals.loc[valid_idx, 'stop_loss'] = ema_vwap_stops.loc[valid_idx]
-            
-            # MM/Vol strategy sell signals
-            mm_vol_sell_idx = sell_idx[signals.loc[sell_idx, 'mm_vol_bearish']]
-            if not mm_vol_sell_idx.empty:
-                common_idx = mm_vol_sell_idx.intersection(mm_vol_targets.index)
-                if not common_idx.empty:
-                    valid_idx = common_idx[~pd.isna(mm_vol_targets.loc[common_idx])]
-                    if not valid_idx.empty:
-                        signals.loc[valid_idx, 'target_price'] = mm_vol_targets.loc[valid_idx]
-                        signals.loc[valid_idx, 'stop_loss'] = mm_vol_stops.loc[valid_idx]
-        
-        # Map signal strength using buy_score and sell_score
-        signals['signal_strength'] = 0
-        
-        # For buy signals
-        buy_strength_conditions = [
-            signals['buy_score'] >= 0.85,
-            signals['buy_score'] >= 0.70,
-            signals['buy_score'] >= 0.60
-        ]
-        
-        buy_strength_choices = [
-            SignalStrength.VERY_STRONG.value,
-            SignalStrength.STRONG.value,
-            SignalStrength.MODERATE.value
-        ]
-        
-        # Default to WEAK if below threshold
-        buy_default = SignalStrength.WEAK.value
-        
-        # Apply strength mapping for buy signals
-        mask = signals['buy_signal']
-        if mask.any():
-            signals.loc[mask, 'signal_strength'] = np.select(
-                buy_strength_conditions,
-                buy_strength_choices,
-                default=buy_default
-            )[mask]
-        
-        # For sell signals
-        sell_strength_conditions = [
-            signals['sell_score'] >= 0.85,
-            signals['sell_score'] >= 0.70,
-            signals['sell_score'] >= 0.60
-        ]
-        
-        sell_strength_choices = [
-            SignalStrength.VERY_STRONG.value,
-            SignalStrength.STRONG.value,
-            SignalStrength.MODERATE.value
-        ]
-        
-        # Default to WEAK if below threshold
-        sell_default = SignalStrength.WEAK.value
-        
-        # Apply strength mapping for sell signals
-        mask = signals['sell_signal']
-        if mask.any():
-            signals.loc[mask, 'signal_strength'] = np.select(
-                sell_strength_conditions,
-                sell_strength_choices,
-                default=sell_default
-            )[mask]
-        
-        # Set strong signals flag using vectorized operations
-        signals['strong_buy'] = signals['buy_signal'] & (signals['signal_strength'] >= 3)
-        signals['strong_sell'] = signals['sell_signal'] & (signals['signal_strength'] >= 3)
+            # Map sell signal strength
+            if signals.at[idx, 'sell_confirm_count'] >= 3:
+                signals.at[idx, 'signal_strength'] = SignalStrength.VERY_STRONG.value
+            elif signals.at[idx, 'sell_confirm_count'] >= 2:
+                signals.at[idx, 'signal_strength'] = SignalStrength.STRONG.value
+            elif signals.at[idx, 'sell_confirm_count'] >= 1:
+                signals.at[idx, 'signal_strength'] = SignalStrength.MODERATE.value
+            else:
+                signals.at[idx, 'signal_strength'] = SignalStrength.WEAK.value
+                
+            # Set strong signals flags
+            signals.at[idx, 'strong_buy_signal'] = signals.at[idx, 'buy_signal'] and signals.at[idx, 'signal_strength'] >= SignalStrength.STRONG.value
+            signals.at[idx, 'strong_sell_signal'] = signals.at[idx, 'sell_signal'] and signals.at[idx, 'signal_strength'] >= SignalStrength.STRONG.value
             
         return signals
+        
+    # If using the generator's signals failed, try the advanced approach
+    try:
+        advanced_results = generate_signals_advanced({"default": data}, "default")
+        if "signals" in advanced_results and isinstance(advanced_results["signals"], pd.DataFrame):
+            return advanced_results["signals"]
     except Exception as e:
-        # If the signal generation fails, return a minimal valid signals DataFrame
-        print(f"Error in signal generation: {str(e)}")
-        minimal_signals = pd.DataFrame(index=data.index)
-        minimal_signals['buy_signal'] = False
-        minimal_signals['sell_signal'] = False
-        minimal_signals['signal_strength'] = 0
-        minimal_signals['target_price'] = np.nan
-        minimal_signals['stop_loss'] = np.nan
-        minimal_signals['signal_price'] = np.nan
-        minimal_signals['signal_time_et'] = ''
-        return minimal_signals
-
+        print(f"Error in advanced signal generation: {str(e)}")
+    
+    # Fallback to a minimal set of signals if all else fails
+    logger = logging.getLogger(__name__)
+    logger.warning("Falling back to minimal signal dataset")
+    
+    minimal_signals = pd.DataFrame(index=data.index)
+    minimal_signals["signal_price"] = data["close"]
+    minimal_signals["signal_time_et"] = ""
+    minimal_signals["buy_signal"] = False
+    minimal_signals["sell_signal"] = False
+    minimal_signals["signal_strength"] = 0
+    minimal_signals["buy_count"] = 0
+    minimal_signals["sell_count"] = 0
+    minimal_signals["buy_score"] = 0.0
+    minimal_signals["sell_score"] = 0.0
+    minimal_signals["buy_confirm_count"] = 0
+    minimal_signals["sell_confirm_count"] = 0
+    minimal_signals["target_price"] = None
+    minimal_signals["stop_loss"] = None
+    
+    print(f"Signal generation complete: {minimal_signals['buy_signal'].sum()} buy signals, {minimal_signals['sell_signal'].sum()} sell signals")
+    
+    return minimal_signals
+    
 def generate_signals_advanced(data_dict: Dict[str, pd.DataFrame], primary_tf: str = None) -> Dict[str, Any]:
     """
     Generate trading signals using the advanced signal processing system
@@ -946,6 +631,35 @@ def generate_signals_advanced(data_dict: Dict[str, pd.DataFrame], primary_tf: st
         return {}
         
     try:
+        # Filter data to only include market hours for each timeframe
+        market_hours_data = {}
+        for tf, df in data_dict.items():
+            # Check if data has enough points
+            if df is None or len(df) < 20:
+                continue
+                
+            # Filter to include only market hours
+            market_idx = df.index[[is_market_hours(idx) for idx in df.index]]
+            
+            # Only include this timeframe if it has sufficient data points after filtering
+            if len(market_idx) >= 20:
+                market_hours_data[tf] = df.loc[market_idx]
+            else:
+                print(f"Insufficient market hours data for timeframe {tf} (only {len(market_idx)} points)")
+        
+        # Check if we have any timeframes with sufficient market hours data
+        if not market_hours_data:
+            print("Insufficient data for signal scoring - no timeframes have enough market hours data (min 20 points)")
+            # Return empty results with message
+            return {
+                'signals': pd.DataFrame(),
+                'metrics': {'error': 'Insufficient market hours data'},
+                'primary_timeframe': primary_tf
+            }
+        
+        # Update data_dict to use only filtered data
+        data_dict = market_hours_data
+        
         # Create advanced signal processor
         processor = AdvancedSignalProcessor()
         
@@ -1103,96 +817,99 @@ def generate_signals_advanced(data_dict: Dict[str, pd.DataFrame], primary_tf: st
                 signals['confidence'] = result['confidence']
                 
             # Add component scores
-            for component in ['trend_score', 'momentum_score', 'volume_score', 'volatility_score']:
-                if component in result:
-                    signals[component] = result[component]
-                    
-            # Add multi-timeframe metrics
-            if 'consensus_score' in result:
-                signals['consensus_score'] = result['consensus_score']
+            for component, score in result.get('component_scores', {}).items():
+                signals[component] = score
+        
+        # Setup TimeFrameManager and process multi-timeframe data
+        tf_manager = TimeFrameManager()
+        
+        # Add all timeframes to the manager
+        for tf_name, tf_data in data_dict.items():
+            # Determine priority based on timeframe name
+            priority = TimeFramePriority.SECONDARY
+            if tf_name == primary_tf:
+                priority = TimeFramePriority.PRIMARY
+            elif tf_name in ["1d", "1w"]:
+                priority = TimeFramePriority.CONTEXT
+            elif tf_name in ["1m", "5m"]:
+                priority = TimeFramePriority.TERTIARY
                 
-            if 'aligned' in result:
-                signals['timeframes_aligned'] = result['aligned']
-                
-            # Generate target prices and stop losses based on ATR if available
-            if 'atr' in primary_data.columns or 'atr' in locals():
-                # Use ATR for position sizing with dynamic multipliers based on signal strength
-                
-                # Default multipliers
-                target_multiplier_base = 2.0
-                stop_multiplier_base = 1.0
-                
-                # Initialize target and stop loss columns
-                signals['target_price'] = None
-                signals['stop_loss'] = None
-                
-                # Use ATR if already in dataframe, otherwise use calculated version
-                if 'atr' not in primary_data.columns and 'atr' in locals():
-                    primary_data['atr'] = atr
-                
-                # Process buy signals
-                buy_idx = signals.index[signals['buy_signal']]
-                if not buy_idx.empty:
-                    for idx in buy_idx:
-                        if idx not in primary_data.index:
-                            continue
-                            
-                        # Adjust multipliers based on signal strength
-                        strength = signals.loc[idx, 'signal_strength'] if pd.notnull(signals.loc[idx, 'signal_strength']) else 1
-                        
-                        # Stronger signals get more aggressive targets
-                        target_multiplier = target_multiplier_base * (1 + (strength - 1) * 0.2)
-                        stop_multiplier = stop_multiplier_base * (1 - (strength - 1) * 0.1)
-                        
-                        if 'atr' in primary_data.columns and pd.notnull(primary_data.loc[idx, 'atr']):
-                            signals.loc[idx, 'target_price'] = primary_data.loc[idx, 'close'] + (primary_data.loc[idx, 'atr'] * target_multiplier)
-                            signals.loc[idx, 'stop_loss'] = primary_data.loc[idx, 'close'] - (primary_data.loc[idx, 'atr'] * stop_multiplier)
-                        else:
-                            # Fallback to percentage-based targets
-                            signals.loc[idx, 'target_price'] = primary_data.loc[idx, 'close'] * (1 + 0.01 * target_multiplier)
-                            signals.loc[idx, 'stop_loss'] = primary_data.loc[idx, 'close'] * (1 - 0.005 * stop_multiplier)
-                
-                # Process sell signals
-                sell_idx = signals.index[signals['sell_signal']]
-                if not sell_idx.empty:
-                    for idx in sell_idx:
-                        if idx not in primary_data.index:
-                            continue
-                            
-                        # Adjust multipliers based on signal strength
-                        strength = signals.loc[idx, 'signal_strength'] if pd.notnull(signals.loc[idx, 'signal_strength']) else 1
-                        
-                        # Stronger signals get more aggressive targets
-                        target_multiplier = target_multiplier_base * (1 + (strength - 1) * 0.2)
-                        stop_multiplier = stop_multiplier_base * (1 - (strength - 1) * 0.1)
-                        
-                        if 'atr' in primary_data.columns and pd.notnull(primary_data.loc[idx, 'atr']):
-                            signals.loc[idx, 'target_price'] = primary_data.loc[idx, 'close'] - (primary_data.loc[idx, 'atr'] * target_multiplier)
-                            signals.loc[idx, 'stop_loss'] = primary_data.loc[idx, 'close'] + (primary_data.loc[idx, 'atr'] * stop_multiplier)
-                        else:
-                            # Fallback to percentage-based targets
-                            signals.loc[idx, 'target_price'] = primary_data.loc[idx, 'close'] * (1 - 0.01 * target_multiplier)
-                            signals.loc[idx, 'stop_loss'] = primary_data.loc[idx, 'close'] * (1 + 0.005 * stop_multiplier)
-                            
-            # Set strong signals flag for convenience
-            signals['strong_buy'] = signals['buy_signal'] & (signals['signal_strength'] >= 3)
-            signals['strong_sell'] = signals['sell_signal'] & (signals['signal_strength'] >= 3)
+            # Create TimeFrame object
+            timeframe = TimeFrame(
+                name=tf_name,
+                interval=tf_name,
+                priority=priority
+            )
             
+            # Set data and add to manager
+            timeframe.set_data(tf_data)
+            
+            # Generate basic signals for this timeframe
+            tf_signals = {}
+            if 'score' in signals.columns:
+                # Use already calculated score if available for primary timeframe
+                if tf_name == primary_tf:
+                    tf_signals = {
+                        'buy_signal': signals['buy_signal'].iloc[-1],
+                        'sell_signal': signals['sell_signal'].iloc[-1],
+                        'buy_score': signals['score'].iloc[-1] if signals['buy_signal'].iloc[-1] else 0,
+                        'sell_score': 1 - signals['score'].iloc[-1] if signals['sell_signal'].iloc[-1] else 0,
+                        'signal_strength': signals['signal_strength'].iloc[-1] if 'signal_strength' in signals.columns else 1
+                    }
+                else:
+                    # Calculate basic signals for other timeframes
+                    tf_processor = AdvancedSignalProcessor()
+                    tf_result = tf_processor.calculate_signal_score(tf_data)
+                    tf_signals = {
+                        'buy_signal': tf_result.get('signal_score', 0.5) >= base_buy_threshold,
+                        'sell_signal': tf_result.get('signal_score', 0.5) <= (1 - base_sell_threshold),
+                        'buy_score': tf_result.get('signal_score', 0.5) if tf_result.get('signal_score', 0.5) >= base_buy_threshold else 0,
+                        'sell_score': 1 - tf_result.get('signal_score', 0.5) if tf_result.get('signal_score', 0.5) <= (1 - base_sell_threshold) else 0
+                    }
+            
+            # Set signals on the timeframe
+            timeframe.set_signals(tf_signals)
+            
+            # Add to manager
+            tf_manager.add_timeframe(timeframe)
+            
+        # Set primary timeframe
+        tf_manager.set_primary_timeframe(primary_tf)
+        
+        # Generate enhanced multi-timeframe analysis
+        try:
+            multi_tf_analysis = tf_manager.enhanced_multi_timeframe_analysis(result.get('market_regime'))
+        except (AttributeError, Exception) as e:
+            # Fallback to regular analysis if enhanced method isn't available
+            print(f"Enhanced multi-timeframe analysis not available, using basic: {str(e)}")
+            multi_tf_analysis = tf_manager.analyze_multi_timeframe_signals()
+        
+        # Calculate target prices and stop losses based on ATR
+        if 'buy_signal' in signals.columns or 'sell_signal' in signals.columns:
+            try:
+                for idx in signals.index:
+                    atr_value = atr.loc[idx] if idx in atr.index and not pd.isna(atr.loc[idx]) else signals['signal_price'].iloc[-1] * 0.01
+                    
+                    if signals.loc[idx, 'buy_signal']:
+                        signals.loc[idx, 'target_price'] = signals.loc[idx, 'signal_price'] + (atr_value * 3)
+                        signals.loc[idx, 'stop_loss'] = signals.loc[idx, 'signal_price'] - (atr_value * 1.5)
+                    elif signals.loc[idx, 'sell_signal']:
+                        signals.loc[idx, 'target_price'] = signals.loc[idx, 'signal_price'] - (atr_value * 3)
+                        signals.loc[idx, 'stop_loss'] = signals.loc[idx, 'signal_price'] + (atr_value * 1.5)
+            except Exception as e:
+                print(f"Error calculating target prices: {str(e)}")
+        
         return {
             'signals': signals,
             'metrics': result,
-            'primary_timeframe': primary_tf
+            'primary_timeframe': primary_tf,
+            'multi_timeframe_analysis': multi_tf_analysis
         }
         
     except Exception as e:
-        logger = logging.getLogger(__name__)
-        logger.error(f"Error generating advanced signals: {str(e)}")
-        # Return minimal valid DataFrame to avoid breaking visualizations
-        minimal_signals = pd.DataFrame(index=list(data_dict.values())[0].index if data_dict else [])
-        minimal_signals['signal_price'] = np.nan
-        minimal_signals['signal_time_et'] = ''
+        print(f"Error in advanced signal generation: {str(e)}")
         return {
-            'signals': minimal_signals,
-            'metrics': {},
+            'signals': pd.DataFrame(),
+            'metrics': {'error': f'Error generating signals: {str(e)}'},
             'primary_timeframe': primary_tf
         } 

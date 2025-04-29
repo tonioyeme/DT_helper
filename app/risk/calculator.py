@@ -126,6 +126,73 @@ def calculate_position_size(account_size, risk_percentage, entry_price, stop_los
     
     return position_size
 
+def calculate_dynamic_position_size(account_size, risk_percentage, entry_price, stop_loss_price, volatility, signal_strength=None, market_conditions=None):
+    """
+    Calculate position size with dynamic adjustments based on volatility, signal strength, and market conditions
+    
+    Args:
+        account_size (float): Total account balance
+        risk_percentage (float): Percentage of account to risk (0-100)
+        entry_price (float): Entry price of the trade
+        stop_loss_price (float): Stop loss price
+        volatility (float): Volatility measure (e.g., ATR divided by price)
+        signal_strength (int, optional): Strength of the signal (1-4)
+        market_conditions (str, optional): Market regime/conditions (e.g., "bull", "bear", "sideways", "volatile")
+        
+    Returns:
+        float: Dynamically adjusted position size (number of shares/contracts)
+    """
+    if account_size <= 0:
+        raise ValueError("Account size must be positive")
+    
+    if risk_percentage <= 0 or risk_percentage > 100:
+        raise ValueError("Risk percentage must be between 0 and 100")
+    
+    # Convert percentage to decimal
+    risk_fraction = risk_percentage / 100
+    
+    # Calculate base risk amount
+    risk_amount = account_size * risk_fraction
+    
+    # Calculate price difference for risk
+    price_diff = abs(entry_price - stop_loss_price)
+    
+    if price_diff <= 0:
+        raise ValueError("Price difference must be positive")
+    
+    # Calculate base position size
+    base_size = risk_amount / price_diff
+    
+    # Apply volatility scaling (0.5-1.5x)
+    # Lower position size in high volatility, higher in low volatility
+    reference_volatility = 0.02  # 2% as reference volatility
+    vol_factor = np.clip(reference_volatility / max(volatility, 0.001), 0.5, 1.5)
+    
+    # Apply signal strength adjustment if provided
+    signal_factor = 1.0
+    if signal_strength is not None:
+        # Scale between 0.8-1.2 based on signal strength (1-4)
+        signal_factor = 0.8 + (signal_strength - 1) * 0.1
+    
+    # Apply market condition adjustment if provided
+    market_factor = 1.0
+    if market_conditions is not None:
+        market_conditions = market_conditions.lower()
+        if market_conditions == "bull":
+            market_factor = 1.1  # More aggressive in bull market
+        elif market_conditions == "bear":
+            market_factor = 0.9  # More conservative in bear market
+        elif market_conditions == "volatile":
+            market_factor = 0.8  # More conservative in volatile market
+        elif market_conditions == "sideways":
+            market_factor = 1.0  # Neutral in sideways market
+    
+    # Calculate final position size with all adjustments
+    adjusted_size = base_size * vol_factor * signal_factor * market_factor
+    
+    # Round down to ensure we don't exceed risk limits
+    return np.floor(adjusted_size)
+
 def calculate_expected_return(entry_price, target_price, stop_loss_price, win_probability):
     """
     Calculate expected return of a trade

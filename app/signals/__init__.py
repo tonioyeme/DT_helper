@@ -1,4 +1,4 @@
-from app.signals.generator import create_default_signal_generator, SignalGenerator, generate_signals
+from app.signals.generator import create_default_signal_generator, SignalGenerator, generate_signals, generate_signals_advanced
 from app.signals.layers import (
     IndicatorLayers, IndicatorLayer, Indicator, 
     IndicatorCategory, SignalType,
@@ -15,11 +15,16 @@ from app.signals.timeframes import (
 from app.signals.scoring import (
     DynamicSignalScorer, SignalStrength, MarketRegime
 )
+from app.signals.processing import (
+    AdvancedSignalProcessor, calculate_advanced_signal_score,
+    calculate_multi_timeframe_signal_score
+)
 
 __all__ = [
     'create_default_signal_generator',
     'SignalGenerator',
     'generate_signals',
+    'generate_signals_advanced',
     'IndicatorLayers',
     'IndicatorLayer',
     'Indicator',
@@ -36,5 +41,8 @@ __all__ = [
     'create_standard_timeframes',
     'DynamicSignalScorer',
     'SignalStrength',
-    'MarketRegime'
+    'MarketRegime',
+    'AdvancedSignalProcessor',
+    'calculate_advanced_signal_score',
+    'calculate_multi_timeframe_signal_score'
 ] 

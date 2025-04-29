@@ -4,6 +4,7 @@ from typing import Dict, List, Optional, Tuple, Callable, Any
 from datetime import datetime, timedelta
 from enum import Enum
 import pytz
+import logging
 
 class TimeFrameStrength(Enum):
     """Enum representing the importance weight of different timeframes"""
@@ -83,6 +84,7 @@ class TimeFrameManager:
         """Initialize the timeframe manager"""
         self.timeframes: Dict[str, TimeFrame] = {}
         self.primary_timeframe: Optional[str] = None
+        self.logger = logging.getLogger(__name__)
         
     def add_timeframe(self, timeframe: TimeFrame) -> None:
         """
@@ -414,6 +416,211 @@ class TimeFrameManager:
             consolidated["sell_strength"] = 0
             
         return consolidated
+        
+    def enhanced_multi_timeframe_analysis(self, market_regime=None) -> Dict[str, Any]:
+        """
+        Enhanced multi-timeframe signal analysis with dynamic weighting based on
+        current market conditions and historical performance
+        
+        Args:
+            market_regime: Optional market regime to adjust weights
+            
+        Returns:
+            Dictionary with consolidated signal analysis and enhanced metrics
+        """
+        # Start with basic analysis from the regular method
+        base_analysis = self.analyze_multi_timeframe_signals()
+        
+        if "error" in base_analysis:
+            return base_analysis
+            
+        # Create enhanced analysis with additional metrics
+        enhanced = {
+            **base_analysis,
+            "market_regime": market_regime,
+            "weighted_signals": {},
+            "timeframe_alignment": 0.0,
+            "component_scores": {},
+            "regime_adjusted_confidence": 0.0
+        }
+        
+        # Define timeframe weights by importance/length
+        timeframe_importance = {
+            # General weights for timeframe importance in different market regimes
+            "default": {
+                "1m": 0.6,  # Less important, more noise
+                "5m": 0.7, 
+                "15m": 0.8,
+                "30m": 0.9,
+                "1h": 1.0,  # Base reference
+                "4h": 1.2,
+                "1d": 1.5,
+                "1w": 2.0   # More important for overall trend
+            },
+            "trending": {  # When market is trending
+                "1m": 0.5,  # Even less important in trends
+                "5m": 0.6,
+                "15m": 0.7,
+                "30m": 0.8,
+                "1h": 1.0,
+                "4h": 1.3, 
+                "1d": 1.7,  # Higher weights for longer timeframes in trends
+                "1w": 2.2
+            },
+            "ranging": {   # When market is range-bound
+                "1m": 0.8,  # More important in ranges
+                "5m": 0.9,
+                "15m": 1.0,
+                "30m": 1.0,
+                "1h": 1.0,
+                "4h": 0.9,  # Less important
+                "1d": 0.8,
+                "1w": 0.7   # Less important in ranges
+            },
+            "volatile": {  # In volatile markets
+                "1m": 0.5,  # Too noisy
+                "5m": 0.6,
+                "15m": 0.7,
+                "30m": 0.8,
+                "1h": 1.0,
+                "4h": 1.2,
+                "1d": 1.4,
+                "1w": 1.6
+            }
+        }
+        
+        # Determine which set of weights to use based on market regime
+        weight_key = "default"
+        if market_regime:
+            regime_name = str(market_regime).lower()
+            if "bull" in regime_name or "bear" in regime_name:
+                weight_key = "trending"
+            elif "range" in regime_name or "sideways" in regime_name:
+                weight_key = "ranging"
+            elif "volatile" in regime_name or "breakout" in regime_name:
+                weight_key = "volatile"
+        
+        # Get the weights for the current market condition
+        regime_weights = timeframe_importance.get(weight_key, timeframe_importance["default"])
+        
+        # Track agreement and disagreement across timeframes
+        agreement_score = 0.0
+        total_comparisons = 0
+        
+        # Calculate weighted signals for each timeframe
+        weighted_signals = {}
+        
+        for tf_name, tf in self.timeframes.items():
+            if tf.signals is None:
+                continue
+                
+            # Get dynamic weight based on timeframe
+            tf_base_weight = regime_weights.get(tf_name, 1.0)
+            
+            # Apply priority multiplier
+            priority_multiplier = 1.0
+            if tf.priority == TimeFramePriority.PRIMARY:
+                priority_multiplier = 1.4
+            elif tf.priority == TimeFramePriority.SECONDARY:
+                priority_multiplier = 1.2
+            elif tf.priority == TimeFramePriority.TERTIARY:
+                priority_multiplier = 1.0
+            elif tf.priority == TimeFramePriority.CONTEXT:
+                priority_multiplier = 0.8
+                
+            # Calculate final weight
+            final_weight = tf_base_weight * priority_multiplier
+            
+            # Store signal with its weight
+            weighted_signals[tf_name] = {
+                "signals": tf.signals,
+                "weight": final_weight
+            }
+            
+        enhanced["weighted_signals"] = weighted_signals
+        
+        # Calculate alignment score across all timeframes
+        # Higher value means better agreement between timeframes
+        for i, (tf1_name, tf1_data) in enumerate(weighted_signals.items()):
+            for j, (tf2_name, tf2_data) in enumerate(weighted_signals.items()):
+                if i >= j:  # Skip self-comparisons and duplicates
+                    continue
+                    
+                # Calculate similarity between two timeframes
+                tf1_signals = tf1_data["signals"]
+                tf2_signals = tf2_data["signals"]
+                
+                # Simple agreement check
+                agreement = 0.0
+                
+                # Check signal agreement
+                if (tf1_signals.get("buy_signal", False) and tf2_signals.get("buy_signal", False)) or \
+                   (tf1_signals.get("sell_signal", False) and tf2_signals.get("sell_signal", False)) or \
+                   (tf1_signals.get("neutral_signal", False) and tf2_signals.get("neutral_signal", False)):
+                    agreement = 1.0
+                # Check partial agreement (one neutral, one directional)
+                elif (tf1_signals.get("neutral_signal", False) or tf2_signals.get("neutral_signal", False)):
+                    agreement = 0.5
+                # Complete disagreement
+                else:
+                    agreement = 0.0
+                    
+                # Weight the agreement by the importance of both timeframes
+                weighted_agreement = agreement * (tf1_data["weight"] + tf2_data["weight"]) / 2
+                
+                agreement_score += weighted_agreement
+                total_comparisons += 1
+                
+        # Calculate final alignment score (0-1 range)
+        if total_comparisons > 0:
+            enhanced["timeframe_alignment"] = agreement_score / total_comparisons
+        
+        # Adjust confidence based on timeframe alignment
+        if "confidence" in enhanced:
+            regime_adjustment = 1.0
+            
+            # Apply regime-specific confidence adjustments
+            if market_regime:
+                regime_name = str(market_regime).lower()
+                if "bull" in regime_name:
+                    if enhanced.get("buy_signal", False):
+                        regime_adjustment = 1.2  # Increase confidence in bull market buy signals
+                    else:
+                        regime_adjustment = 0.8  # Decrease confidence in bull market sell signals
+                elif "bear" in regime_name:
+                    if enhanced.get("sell_signal", False):
+                        regime_adjustment = 1.2  # Increase confidence in bear market sell signals
+                    else:
+                        regime_adjustment = 0.8  # Decrease confidence in bear market buy signals
+                elif "volatile" in regime_name:
+                    regime_adjustment = 0.85  # Decrease confidence in volatile markets
+                
+            # Calculate final confidence with alignment and regime adjustment
+            alignment_factor = enhanced["timeframe_alignment"]
+            base_confidence = enhanced["confidence"]
+            
+            # Higher alignment increases confidence, lower alignment decreases it
+            alignment_adjustment = (alignment_factor - 0.5) * 0.3
+            
+            # Apply both adjustments
+            enhanced["regime_adjusted_confidence"] = max(0.0, min(1.0, 
+                (base_confidence + alignment_adjustment) * regime_adjustment
+            ))
+            
+        # Calculate component scores for visualization
+        component_scores = {}
+        
+        if self.primary_timeframe and self.primary_timeframe in self.timeframes:
+            primary_tf = self.timeframes[self.primary_timeframe]
+            if primary_tf.signals:
+                # Extract component scores if available
+                for key, value in primary_tf.signals.items():
+                    if key.endswith("_score") and key not in ["buy_score", "sell_score"]:
+                        component_scores[key] = value
+                        
+        enhanced["component_scores"] = component_scores
+        
+        return enhanced
 
 # Utility functions for timeframe conversion and management
 

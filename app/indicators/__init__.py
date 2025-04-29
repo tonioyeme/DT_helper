@@ -13,6 +13,13 @@ from app.indicators.strategies import (
     calculate_measured_move_volume_strategy,
     multi_indicator_confirmation
 )
+from app.indicators.advanced import (
+    calculate_roc,
+    calculate_hull_moving_average,
+    calculate_ttm_squeeze,
+    detect_hidden_divergence,
+    add_advanced_indicators
+)
 
 __all__ = [
     'calculate_ema',
@@ -27,5 +34,11 @@ __all__ = [
     'calculate_pain',
     'calculate_ema_vwap_strategy',
     'calculate_measured_move_volume_strategy',
-    'multi_indicator_confirmation'
+    'multi_indicator_confirmation',
+    # Advanced indicators
+    'calculate_roc',
+    'calculate_hull_moving_average',
+    'calculate_ttm_squeeze',
+    'detect_hidden_divergence',
+    'add_advanced_indicators'
 ] 
