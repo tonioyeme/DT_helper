@@ -1,14 +1,14 @@
 import pandas as pd
 import numpy as np
 
-def calculate_macd(data, fast_period=12, slow_period=26, signal_period=9):
+def calculate_macd(data, fast_period=6, slow_period=13, signal_period=9):
     """
     Calculate Moving Average Convergence Divergence (MACD)
     
     Args:
         data (pd.DataFrame): DataFrame with 'close' price column
-        fast_period (int): Fast EMA period
-        slow_period (int): Slow EMA period
+        fast_period (int): Fast EMA period (default: 6 for better sensitivity on shorter timeframes)
+        slow_period (int): Slow EMA period (default: 13 for better sensitivity on shorter timeframes)
         signal_period (int): Signal line period
         
     Returns:

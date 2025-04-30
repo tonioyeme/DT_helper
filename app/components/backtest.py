@@ -72,7 +72,8 @@ def render_backtest_ui(data, symbol=None):
         "Single Strategy", 
         "Compare Strategies", 
         "Signal Strength Analysis", 
-        "Position Sizing"
+        "Position Sizing",
+        "Walk-Forward Validation"
     ])
     
     # Tab 1: Single Strategy Backtest
@@ -752,4 +753,234 @@ def render_backtest_ui(data, symbol=None):
                         st.warning("No optimization results available.")
                 
                 except Exception as e:
-                    st.error(f"Error optimizing position size: {str(e)}") 
+                    st.error(f"Error optimizing position size: {str(e)}")
+    
+    # Tab 5: Walk-Forward Validation (add after Tab 4)
+    with backtest_tabs[4]:
+        st.subheader("Walk-Forward Validation")
+        st.markdown("""
+        Walk-forward validation tests the strategy's robustness across multiple time periods, 
+        helping to identify potential overfitting and confirm strategy effectiveness.
+        """)
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            # Strategy selection
+            available_strategies = get_available_strategies()
+            selected_strategy = st.selectbox(
+                "Select Strategy",
+                available_strategies,
+                index=0,
+                key="wf_strategy",
+                help="Select a strategy to validate"
+            )
+            
+            # Number of splits
+            n_splits = st.slider(
+                "Number of Testing Periods",
+                min_value=3,
+                max_value=10,
+                value=5,
+                step=1,
+                key="wf_splits",
+                help="More periods give more comprehensive validation"
+            )
+            
+            # Train ratio
+            train_ratio = st.slider(
+                "Training Data Ratio",
+                min_value=0.5,
+                max_value=0.9,
+                value=0.7,
+                step=0.05,
+                key="wf_train_ratio",
+                help="Portion of each period used for training (vs testing)"
+            )
+        
+        with col2:
+            # Backtest parameters
+            initial_capital = st.number_input(
+                "Initial Capital ($)",
+                min_value=1000.0,
+                max_value=1000000.0,
+                value=10000.0,
+                step=1000.0,
+                key="wf_initial_capital"
+            )
+            
+            position_size = st.slider(
+                "Position Size (%)",
+                min_value=1.0,
+                max_value=50.0,
+                value=10.0,
+                step=1.0,
+                key="wf_position_size"
+            ) / 100.0
+            
+            commission = st.slider(
+                "Commission (%)",
+                min_value=0.0,
+                max_value=2.0,
+                value=0.1,
+                step=0.01,
+                key="wf_commission"
+            )
+            
+            slippage = st.slider(
+                "Slippage (%)",
+                min_value=0.0,
+                max_value=2.0,
+                value=0.05,
+                step=0.01,
+                key="wf_slippage"
+            )
+        
+        # Run validation button
+        if st.button("Run Walk-Forward Validation", key="run_wf_validation"):
+            with st.spinner("Running walk-forward validation (this may take a while)..."):
+                try:
+                    # Run walk-forward test
+                    wf_results = walk_forward_test(
+                        data=data,
+                        strategy=selected_strategy if selected_strategy != "all" else None,
+                        n_splits=n_splits,
+                        train_ratio=train_ratio,
+                        initial_capital=initial_capital,
+                        position_size=position_size,
+                        commission=commission,
+                        slippage=slippage
+                    )
+                    
+                    # Get results and summary
+                    results = wf_results['results']
+                    summary = wf_results['summary']
+                    
+                    # Display results if we have any
+                    if results:
+                        # Display overall robustness score
+                        robustness = summary['robustness_score'] * 100
+                        if robustness >= 70:
+                            score_color = "green"
+                            robustness_text = "High"
+                        elif robustness >= 50:
+                            score_color = "orange"
+                            robustness_text = "Medium"
+                        else:
+                            score_color = "red"
+                            robustness_text = "Low"
+                        
+                        st.markdown(f"""
+                        <div style="padding: 10px; border-radius: 5px; background-color: {score_color}; color: white; font-size: 20px; font-weight: bold; text-align: center; margin-bottom: 20px;">
+                            Strategy Robustness: {robustness_text} ({robustness:.0f}%)
+                        </div>
+                        """, unsafe_allow_html=True)
+                        
+                        # Create a table of results
+                        results_df = pd.DataFrame(results)
+                        
+                        # Format dates if they're datetime objects
+                        for col in ['train_start', 'train_end', 'test_start', 'test_end']:
+                            if col in results_df.columns:
+                                results_df[col] = results_df[col].apply(
+                                    lambda x: x.strftime('%Y-%m-%d %H:%M') if hasattr(x, 'strftime') else str(x)
+                                )
+                        
+                        # Format numerical columns
+                        results_df['train_sharpe'] = results_df['train_sharpe'].round(2)
+                        results_df['test_sharpe'] = results_df['test_sharpe'].round(2)
+                        results_df['train_return'] = results_df['train_return'].round(2)
+                        results_df['test_return'] = results_df['test_return'].round(2)
+                        
+                        # Add a status column
+                        results_df['status'] = results_df.apply(
+                            lambda x: "✅ Consistent" if x['consistency'] == 1 else "❌ Inconsistent", 
+                            axis=1
+                        )
+                        
+                        # Display the results table
+                        st.subheader("Results by Period")
+                        st.dataframe(results_df[['split', 'train_start', 'train_end', 'test_start', 'test_end', 
+                                              'train_return', 'test_return', 'train_sharpe', 'test_sharpe', 'status']])
+                        
+                        # Create graphs for visualization
+                        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
+                        
+                        # Plot returns
+                        ax1.set_title("Returns by Period")
+                        ax1.plot(summary['splits'], summary['train_return'], 'b-', label='Train Return (%)')
+                        ax1.plot(summary['splits'], summary['test_return'], 'r--', label='Test Return (%)')
+                        ax1.set_xlabel('Period')
+                        ax1.set_ylabel('Return (%)')
+                        ax1.legend()
+                        ax1.grid(True)
+                        
+                        # Plot Sharpe ratios
+                        ax2.set_title("Sharpe Ratio by Period")
+                        ax2.plot(summary['splits'], summary['train_sharpe'], 'g-', label='Train Sharpe')
+                        ax2.plot(summary['splits'], summary['test_sharpe'], 'm--', label='Test Sharpe')
+                        ax2.set_xlabel('Period')
+                        ax2.set_ylabel('Sharpe Ratio')
+                        ax2.legend()
+                        ax2.grid(True)
+                        
+                        plt.tight_layout()
+                        st.pyplot(fig)
+                        
+                        # Interpretation
+                        st.subheader("Interpretation")
+                        
+                        avg_train_return = np.mean(summary['train_return'])
+                        avg_test_return = np.mean(summary['test_return'])
+                        avg_train_sharpe = np.mean(summary['train_sharpe'])
+                        avg_test_sharpe = np.mean(summary['test_sharpe'])
+                        
+                        # Calculate the difference between train and test
+                        return_degradation = ((avg_train_return - avg_test_return) / abs(avg_train_return)) * 100 if avg_train_return != 0 else 0
+                        sharpe_degradation = ((avg_train_sharpe - avg_test_sharpe) / avg_train_sharpe) * 100 if avg_train_sharpe != 0 else 0
+                        
+                        st.markdown(f"""
+                        - Average Training Return: **{avg_train_return:.2f}%**
+                        - Average Testing Return: **{avg_test_return:.2f}%**
+                        - Performance Degradation: **{return_degradation:.1f}%**
+                        
+                        - Average Training Sharpe: **{avg_train_sharpe:.2f}**
+                        - Average Testing Sharpe: **{avg_test_sharpe:.2f}**
+                        - Sharpe Degradation: **{sharpe_degradation:.1f}%**
+                        """)
+                        
+                        # Conclusions based on results
+                        if robustness >= 70 and return_degradation < 30:
+                            st.success("The strategy shows good robustness and consistency across different time periods.")
+                        elif robustness >= 50 and return_degradation < 50:
+                            st.warning("The strategy shows moderate robustness, but there is some degradation in out-of-sample performance.")
+                        else:
+                            st.error("The strategy shows signs of overfitting. Performance degradation in out-of-sample periods is significant.")
+                        
+                        # Recommendations
+                        st.subheader("Recommendations")
+                        if robustness < 50:
+                            st.markdown("""
+                            - Consider simplifying the strategy to reduce potential overfitting
+                            - Test with different parameters or additional filters
+                            - Consider the market conditions during periods of inconsistency
+                            """)
+                        elif return_degradation > 50:
+                            st.markdown("""
+                            - The strategy shows directional consistency but significant performance degradation
+                            - Consider using more conservative position sizing in live trading
+                            - Implement additional risk management rules
+                            """)
+                        else:
+                            st.markdown("""
+                            - The strategy shows good robustness and can be considered for live trading
+                            - Continue to monitor performance and compare to walk-forward benchmarks
+                            - Consider further optimization of entry/exit criteria to improve consistency
+                            """)
+                    else:
+                        st.warning("No validation results available. This could be due to insufficient data for the selected number of splits.")
+                
+                except Exception as e:
+                    st.error(f"Error during walk-forward validation: {str(e)}")
+                    import traceback
+                    st.code(traceback.format_exc()) 

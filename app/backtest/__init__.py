@@ -5,7 +5,9 @@ from app.backtest.strategies import (
     create_strategy_comparison,
     create_signal_strength_comparison,
     optimize_position_size,
-    get_available_strategies
+    get_available_strategies,
+    calculate_sharpe,
+    walk_forward_test
 )
 
 __all__ = [
@@ -15,5 +17,7 @@ __all__ = [
     'create_strategy_comparison',
     'create_signal_strength_comparison',
     'optimize_position_size',
-    'get_available_strategies'
+    'get_available_strategies',
+    'calculate_sharpe',
+    'walk_forward_test'
 ] 

@@ -23,6 +23,97 @@ class MarketRegime(Enum):
     BREAKOUT = "breakout"                  # Breaking from a range
     REVERSAL = "reversal"                  # Potential trend reversal
 
+class IndicatorCategory(Enum):
+    """Indicator categories for weighting in the scoring system"""
+    TREND = "trend"
+    MOMENTUM = "momentum"
+    VOLATILITY = "volatility"
+    VOLUME = "volume"
+    OSCILLATOR = "oscillator"
+    PATTERN = "pattern"
+    SUPPORT_RESISTANCE = "support_resistance"
+
+def calculate_dynamic_signal_score(indicators, market_regime):
+    """
+    Calculate a dynamic signal score based on current market conditions
+    
+    Args:
+        indicators (dict): Dictionary of indicator signals and values
+        market_regime (MarketRegime): Current market regime
+        
+    Returns:
+        float: Signal score between 0 and 1
+    """
+    # Base weights for different indicator categories
+    category_weights = {
+        IndicatorCategory.TREND: 1.0,
+        IndicatorCategory.MOMENTUM: 0.8,
+        IndicatorCategory.VOLATILITY: 0.6,
+        IndicatorCategory.VOLUME: 0.7,
+        IndicatorCategory.OSCILLATOR: 0.8,
+        IndicatorCategory.PATTERN: 0.9,
+        IndicatorCategory.SUPPORT_RESISTANCE: 1.1
+    }
+    
+    # Adjust weights based on market regime
+    if market_regime == MarketRegime.BULL_TREND:
+        category_weights[IndicatorCategory.TREND] *= 1.3
+        category_weights[IndicatorCategory.MOMENTUM] *= 1.2
+        category_weights[IndicatorCategory.PATTERN] *= 1.1
+    elif market_regime == MarketRegime.BEAR_TREND:
+        category_weights[IndicatorCategory.VOLATILITY] *= 1.2
+        category_weights[IndicatorCategory.VOLUME] *= 1.2
+        category_weights[IndicatorCategory.SUPPORT_RESISTANCE] *= 1.3
+    elif market_regime == MarketRegime.SIDEWAYS or market_regime == MarketRegime.RANGE_BOUND:
+        category_weights[IndicatorCategory.OSCILLATOR] *= 1.3
+        category_weights[IndicatorCategory.SUPPORT_RESISTANCE] *= 1.2
+        category_weights[IndicatorCategory.TREND] *= 0.7
+    elif market_regime == MarketRegime.HIGH_VOLATILITY:
+        category_weights[IndicatorCategory.VOLATILITY] *= 1.4
+        category_weights[IndicatorCategory.VOLUME] *= 1.3
+        category_weights[IndicatorCategory.PATTERN] *= 0.8
+    elif market_regime == MarketRegime.LOW_VOLATILITY:
+        category_weights[IndicatorCategory.PATTERN] *= 1.2
+        category_weights[IndicatorCategory.OSCILLATOR] *= 1.2
+        category_weights[IndicatorCategory.VOLATILITY] *= 0.7
+    elif market_regime == MarketRegime.BREAKOUT:
+        category_weights[IndicatorCategory.VOLUME] *= 1.4
+        category_weights[IndicatorCategory.MOMENTUM] *= 1.3
+        category_weights[IndicatorCategory.OSCILLATOR] *= 0.7
+    elif market_regime == MarketRegime.REVERSAL:
+        category_weights[IndicatorCategory.PATTERN] *= 1.4
+        category_weights[IndicatorCategory.MOMENTUM] *= 1.2
+        category_weights[IndicatorCategory.TREND] *= 0.6
+    
+    # Calculate weighted score for each indicator
+    total_weight = 0
+    total_score = 0
+    
+    # Keep track of categories with signals
+    categories_with_signals = set()
+    
+    for indicator, signal in indicators.items():
+        weight = category_weights.get(indicator.category, 1.0) * indicator.base_weight
+        total_weight += weight
+        signal_strength = getattr(signal, 'strength', 0.5)  # Default to 0.5 if strength not available
+        total_score += signal_strength * weight
+        categories_with_signals.add(indicator.category)
+    
+    # Normalize score between 0 and 1
+    if total_weight == 0:
+        return 0
+    
+    # Base final score
+    final_score = total_score / total_weight
+    
+    # Bonus for having signals from multiple categories (signal confirmation)
+    category_count_bonus = min(0.2, len(categories_with_signals) * 0.05)  # Up to 0.2 bonus
+    
+    # Apply bonus but keep maximum score at 1.0
+    final_score = min(1.0, final_score + category_count_bonus)
+    
+    return final_score
+
 class DynamicSignalScorer:
     """
     Dynamic signal scoring system that adjusts thresholds based on market conditions,
@@ -314,9 +405,20 @@ class DynamicSignalScorer:
             
         # Get volatility factor
         volatility_factor = 1.0  # Default if not calculated
+        if 'data' in signal_data:
+            volatility_factor = self.calculate_volatility_factor(signal_data['data'])
         
-        # Get adjusted thresholds
+        # Get adjusted thresholds - now using lower thresholds for more adaptive approach
         buy_threshold, sell_threshold = self.get_adjusted_thresholds(market_regime, volatility_factor)
+        
+        # Apply a more permissive factor to thresholds to make them less restrictive
+        buy_threshold *= 0.7  # Reduce the buy threshold by 30%
+        sell_threshold *= 0.7  # Reduce the sell threshold by 30%
+        
+        # Further reduce thresholds in range-bound or breakout conditions
+        if market_regime in [MarketRegime.RANGE_BOUND, MarketRegime.BREAKOUT, MarketRegime.SIDEWAYS]:
+            buy_threshold *= 0.8  # Additional 20% reduction
+            sell_threshold *= 0.8  # Additional 20% reduction
         
         result = signal_data.copy()
         
@@ -368,9 +470,41 @@ class DynamicSignalScorer:
         result['buy_score'] = buy_score
         result['sell_score'] = sell_score
         
+        # Apply dynamic signal scoring
+        try:
+            # Try to use the dynamic scoring if we have category information
+            if 'indicator_categories' in signal_data:
+                dynamic_buy_score = calculate_dynamic_signal_score(
+                    signal_data['indicator_categories'].get('buy', {}), 
+                    market_regime
+                )
+                dynamic_sell_score = calculate_dynamic_signal_score(
+                    signal_data['indicator_categories'].get('sell', {}), 
+                    market_regime
+                )
+                
+                # Blend the scores (80% dynamic, 20% original) - increased weight on dynamic scoring
+                result['buy_score'] = (0.2 * buy_score) + (0.8 * dynamic_buy_score * 10)  # Scale to comparable range
+                result['sell_score'] = (0.2 * sell_score) + (0.8 * dynamic_sell_score * 10)
+                
+                # Add the normalized scores for reference
+                result['buy_score_normalized'] = dynamic_buy_score
+                result['sell_score_normalized'] = dynamic_sell_score
+        except Exception as e:
+            self.logger.warning(f"Could not apply dynamic scoring: {str(e)}")
+            # Keep the original scores if dynamic scoring fails
+        
+        # Lower the score preference ratio for signal detection (less demanding)
+        score_preference_ratio = 1.1  # Previously was implicitly requiring buy > sell
+        
         # Determine final signal based on thresholds
-        result['buy_signal'] = buy_score >= buy_threshold and buy_score > sell_score
-        result['sell_signal'] = sell_score >= sell_threshold and sell_score > buy_score
+        result['buy_signal'] = result['buy_score'] >= buy_threshold and result['buy_score'] >= (result['sell_score'] / score_preference_ratio)
+        result['sell_signal'] = result['sell_score'] >= sell_threshold and result['sell_score'] >= (result['buy_score'] / score_preference_ratio)
         result['neutral_signal'] = not (result['buy_signal'] or result['sell_signal'])
+        
+        # Add confidence level (0-1 scale)
+        buy_confidence = max(0, min(1, (result['buy_score'] - buy_threshold) / buy_threshold)) if result['buy_signal'] else 0
+        sell_confidence = max(0, min(1, (result['sell_score'] - sell_threshold) / sell_threshold)) if result['sell_signal'] else 0
+        result['confidence'] = max(buy_confidence, sell_confidence)
         
         return result 

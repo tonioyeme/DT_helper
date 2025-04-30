@@ -252,4 +252,155 @@ def multi_indicator_confirmation(df, threshold=2):
     confirmed_buy_signals = buy_signal_count >= threshold
     confirmed_sell_signals = sell_signal_count >= threshold
     
-    return confirmed_buy_signals, confirmed_sell_signals 
+    return confirmed_buy_signals, confirmed_sell_signals
+
+def multi_tf_confirmation(primary_tf, trading_tf, entry_tf):
+    """
+    Check alignment between multiple timeframes for trade confirmation
+    
+    This function verifies that:
+    1. The primary trend aligns with the trading timeframe
+    2. The trading timeframe has stronger momentum than the entry timeframe
+    
+    Args:
+        primary_tf (dict): Data from primary (highest) timeframe with 'trend' key
+        trading_tf (dict): Data from trading timeframe with 'trend' and 'momentum' keys
+        entry_tf (dict): Data from entry timeframe with 'momentum' key
+        
+    Returns:
+        bool: True if timeframes align for a valid trade, False otherwise
+    """
+    # Primary trend alignment check
+    if (primary_tf['trend'] == trading_tf['trend'] 
+        and trading_tf['momentum'] > entry_tf['momentum']):
+        return True
+    return False
+
+def calculate_vwap_bollinger_strategy(df, vwap_period='day', bb_length=20, bb_std=2.0):
+    """
+    VWAP + Bollinger Bands strategy for 5-minute SPY trading
+    
+    Args:
+        df (pd.DataFrame): DataFrame with OHLCV price data
+        vwap_period (str): Period for VWAP reset ('day' for daily)
+        bb_length (int): Period for Bollinger Bands calculation
+        bb_std (float): Number of standard deviations for Bollinger Bands
+        
+    Returns:
+        tuple: (bullish_signals, bearish_signals, targets, stop_losses)
+    """
+    from app.indicators import calculate_vwap, calculate_atr
+    
+    df = df.copy()
+    
+    # Calculate VWAP
+    if 'vwap' not in df.columns:
+        df['vwap'] = calculate_vwap(df)
+    
+    # Calculate Bollinger Bands on VWAP
+    vwap_std = df['vwap'].rolling(bb_length).std()
+    df['vwap_upper'] = df['vwap'] + bb_std * vwap_std
+    df['vwap_lower'] = df['vwap'] - bb_std * vwap_std
+    
+    # Calculate ATR for stop losses if not already present
+    if 'atr' not in df.columns:
+        df['atr'] = calculate_atr(df)
+    
+    # Initialize signals
+    bullish_signals = pd.Series(False, index=df.index)
+    bearish_signals = pd.Series(False, index=df.index)
+    targets = pd.Series(np.nan, index=df.index)
+    stop_losses = pd.Series(np.nan, index=df.index)
+    
+    # Generate signals
+    for i in range(3, len(df)):
+        # Bullish signal: Price crosses above VWAP from below after touching lower band
+        if (df['close'].iloc[i-1] < df['vwap'].iloc[i-1] and 
+            df['close'].iloc[i] > df['vwap'].iloc[i] and
+            df['low'].iloc[i-1] <= df['vwap_lower'].iloc[i-1]):
+            
+            bullish_signals.iloc[i] = True
+            targets.iloc[i] = df['close'].iloc[i] + (df['close'].iloc[i] - df['vwap_lower'].iloc[i])
+            stop_losses.iloc[i] = df['vwap_lower'].iloc[i] - df['atr'].iloc[i] * 0.5
+        
+        # Bearish signal: Price crosses below VWAP from above after touching upper band
+        if (df['close'].iloc[i-1] > df['vwap'].iloc[i-1] and 
+            df['close'].iloc[i] < df['vwap'].iloc[i] and
+            df['high'].iloc[i-1] >= df['vwap_upper'].iloc[i-1]):
+            
+            bearish_signals.iloc[i] = True
+            targets.iloc[i] = df['close'].iloc[i] - (df['vwap_upper'].iloc[i] - df['close'].iloc[i])
+            stop_losses.iloc[i] = df['vwap_upper'].iloc[i] + df['atr'].iloc[i] * 0.5
+    
+    return bullish_signals, bearish_signals, targets, stop_losses
+
+def calculate_orb_strategy(df, orb_minutes=5, confirmation_candles=1):
+    """
+    Opening Range Breakout strategy for SPY
+    
+    Args:
+        df (pd.DataFrame): OHLCV data with datetime index
+        orb_minutes (int): Opening range duration in minutes
+        confirmation_candles (int): Number of candles to confirm breakout
+        
+    Returns:
+        tuple: (bullish_signals, bearish_signals, targets, stop_losses)
+    """
+    from app.indicators import calculate_opening_range
+    import pytz
+    
+    df = df.copy()
+    
+    # Initialize signals
+    bullish_signals = pd.Series(False, index=df.index)
+    bearish_signals = pd.Series(False, index=df.index)
+    targets = pd.Series(np.nan, index=df.index)
+    stop_losses = pd.Series(np.nan, index=df.index)
+    
+    # Ensure index is in Eastern Time for market hours
+    eastern = pytz.timezone('US/Eastern')
+    if df.index.tzinfo is not None:
+        df.index = df.index.tz_convert(eastern)
+    
+    # Get opening range
+    or_high, or_low = calculate_opening_range(df, minutes=orb_minutes)
+    if or_high is None or or_low is None:
+        return bullish_signals, bearish_signals, targets, stop_losses
+    
+    # Add ORB levels to dataframe
+    df['or_high'] = or_high
+    df['or_low'] = or_low
+    
+    # Find the index where opening range ends
+    try:
+        market_open_end = df.between_time('09:30', '09:' + str(30 + orb_minutes)).index[-1]
+        or_end_idx = df.index.get_loc(market_open_end)
+    except Exception:
+        # If we can't determine the end of opening range, return empty signals
+        return bullish_signals, bearish_signals, targets, stop_losses
+    
+    # Generate signals after opening range
+    for i in range(or_end_idx + 1, len(df)):
+        # Skip if we don't have enough data for confirmation
+        if i - confirmation_candles < 0:
+            continue
+            
+        # Check for bullish breakout
+        if (df['close'].iloc[i] > or_high and 
+            all(df['close'].iloc[i-confirmation_candles:i] <= or_high)):
+            
+            bullish_signals.iloc[i] = True
+            range_size = or_high - or_low
+            targets.iloc[i] = df['close'].iloc[i] + range_size
+            stop_losses.iloc[i] = or_low
+        
+        # Check for bearish breakout
+        if (df['close'].iloc[i] < or_low and 
+            all(df['close'].iloc[i-confirmation_candles:i] >= or_low)):
+            
+            bearish_signals.iloc[i] = True
+            range_size = or_high - or_low
+            targets.iloc[i] = df['close'].iloc[i] - range_size
+            stop_losses.iloc[i] = or_high
+    
+    return bullish_signals, bearish_signals, targets, stop_losses 

@@ -269,4 +269,166 @@ def get_available_strategies() -> List[str]:
         "strong_signals",
         "strong_buy_only",
         "strong_sell_only"
-    ] 
+    ]
+
+def calculate_sharpe(signals, risk_free_rate=0.0):
+    """
+    Calculate Sharpe ratio based on signals and returns
+    
+    Args:
+        signals (pd.DataFrame): DataFrame with trading signals and returns
+        risk_free_rate (float): Risk-free rate (annualized decimal)
+        
+    Returns:
+        float: Sharpe ratio
+    """
+    if 'returns' not in signals.columns:
+        # If returns not available, try to calculate from price data
+        if all(col in signals.columns for col in ['buy_signal', 'sell_signal', 'close']):
+            # Simple returns calculation based on signals
+            signals['returns'] = 0.0
+            signals.loc[signals['buy_signal'] == True, 'returns'] = signals['close'].pct_change()
+            signals.loc[signals['sell_signal'] == True, 'returns'] = -signals['close'].pct_change()
+        else:
+            return 0.0  # Can't calculate without necessary data
+            
+    # Calculate average return and standard deviation
+    avg_return = signals['returns'].mean() * 252  # Annualize
+    std_return = signals['returns'].std() * np.sqrt(252)  # Annualize
+    
+    # Handle case where std is zero
+    if std_return == 0:
+        return 0.0
+        
+    # Calculate Sharpe ratio
+    sharpe = (avg_return - risk_free_rate) / std_return
+    
+    return sharpe
+
+def walk_forward_test(data, strategy=None, n_splits=5, train_ratio=0.7, 
+                     initial_capital=10000.0, position_size=0.1, 
+                     commission=0.1, slippage=0.05):
+    """
+    Perform walk-forward optimization to validate strategy robustness
+    
+    Args:
+        data (pd.DataFrame): DataFrame with OHLCV price data
+        strategy (str): Strategy name to test (None for all signals)
+        n_splits (int): Number of testing periods
+        train_ratio (float): Ratio of training data in each split
+        initial_capital (float): Initial capital for each test
+        position_size (float): Position size as fraction of capital
+        commission (float): Commission percentage
+        slippage (float): Slippage percentage
+        
+    Returns:
+        dict: Dictionary with walk-forward test results
+    """
+    from app.signals import generate_signals
+    
+    results = []
+    total_length = len(data)
+    split_size = total_length // n_splits
+    
+    # Create summary
+    summary = {
+        'splits': [],
+        'train_sharpe': [],
+        'test_sharpe': [],
+        'train_return': [],
+        'test_return': [],
+        'robustness_score': 0
+    }
+    
+    for i in range(n_splits):
+        # Calculate split indices
+        start_idx = i * split_size
+        train_end_idx = start_idx + int(split_size * train_ratio)
+        test_end_idx = min(train_end_idx + split_size, total_length)
+        
+        # Skip if we don't have enough data
+        if train_end_idx >= total_length or test_end_idx >= total_length:
+            continue
+            
+        # Get train and test data
+        train_data = data.iloc[start_idx:train_end_idx]
+        test_data = data.iloc[train_end_idx:test_end_idx]
+        
+        # Skip small datasets
+        if len(train_data) < 20 or len(test_data) < 10:
+            continue
+            
+        # Generate signals
+        train_signals = generate_signals(train_data)
+        test_signals = generate_signals(test_data)
+        
+        # Filter by strategy if needed
+        if strategy and strategy != "all":
+            train_signals = filter_signals_by_strategy(train_signals, strategy)
+            test_signals = filter_signals_by_strategy(test_signals, strategy)
+        
+        # Initialize backtest for train data
+        train_backtest = BacktestEngine(
+            data=train_data,
+            signals=train_signals,
+            initial_capital=initial_capital,
+            position_size=position_size,
+            commission=commission,
+            slippage=slippage,
+            strategy_name=strategy if strategy else "all"
+        )
+        
+        # Initialize backtest for test data
+        test_backtest = BacktestEngine(
+            data=test_data,
+            signals=test_signals,
+            initial_capital=initial_capital,
+            position_size=position_size,
+            commission=commission,
+            slippage=slippage,
+            strategy_name=strategy if strategy else "all"
+        )
+        
+        # Run backtests
+        train_metrics = train_backtest.run()
+        test_metrics = test_backtest.run()
+        
+        # Calculate performance metrics
+        train_sharpe = calculate_sharpe(train_signals)
+        test_sharpe = calculate_sharpe(test_signals)
+        
+        # Get returns
+        train_return = train_metrics.get('total_return', 0)
+        test_return = test_metrics.get('total_return', 0)
+        
+        # Store results
+        split_result = {
+            'split': i + 1,
+            'train_start': train_data.index[0] if len(train_data) > 0 else None,
+            'train_end': train_data.index[-1] if len(train_data) > 0 else None,
+            'test_start': test_data.index[0] if len(test_data) > 0 else None,
+            'test_end': test_data.index[-1] if len(test_data) > 0 else None,
+            'train_sharpe': train_sharpe,
+            'test_sharpe': test_sharpe,
+            'train_return': train_return,
+            'test_return': test_return,
+            'consistency': 1 if (train_return > 0 and test_return > 0) or (train_return < 0 and test_return < 0) else 0
+        }
+        
+        results.append(split_result)
+        
+        # Update summary
+        summary['splits'].append(i + 1)
+        summary['train_sharpe'].append(train_sharpe)
+        summary['test_sharpe'].append(test_sharpe)
+        summary['train_return'].append(train_return)
+        summary['test_return'].append(test_return)
+    
+    # Calculate robustness score (percentage of test periods where performance is consistent with training)
+    robustness_score = sum(r['consistency'] for r in results) / len(results) if results else 0
+    summary['robustness_score'] = robustness_score
+    
+    return {
+        'results': results,
+        'summary': summary
+    } 

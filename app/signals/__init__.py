@@ -1,4 +1,4 @@
-from app.signals.generator import create_default_signal_generator, SignalGenerator, generate_signals, generate_signals_advanced
+from app.signals.generator import create_default_signal_generator, SignalGenerator, generate_signals, generate_signals_advanced, analyze_single_day, generate_signals_multi_timeframe
 from app.signals.layers import (
     IndicatorLayers, IndicatorLayer, Indicator, 
     IndicatorCategory, SignalType,
@@ -19,12 +19,18 @@ from app.signals.processing import (
     AdvancedSignalProcessor, calculate_advanced_signal_score,
     calculate_multi_timeframe_signal_score
 )
+from app.signals.multi_timeframe import (
+    MultiTimeframeFramework, TimeframeTier, TrendDirection,
+    multi_tf_confirmation
+)
 
 __all__ = [
     'create_default_signal_generator',
     'SignalGenerator',
     'generate_signals',
     'generate_signals_advanced',
+    'generate_signals_multi_timeframe',
+    'analyze_single_day',
     'IndicatorLayers',
     'IndicatorLayer',
     'Indicator',
@@ -44,5 +50,9 @@ __all__ = [
     'MarketRegime',
     'AdvancedSignalProcessor',
     'calculate_advanced_signal_score',
-    'calculate_multi_timeframe_signal_score'
+    'calculate_multi_timeframe_signal_score',
+    'MultiTimeframeFramework',
+    'TimeframeTier',
+    'TrendDirection',
+    'multi_tf_confirmation'
 ] 

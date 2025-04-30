@@ -30,7 +30,9 @@ from app.components import (
     render_patterns_section,
     render_backtest,
     render_signals,
-    render_signal_chart
+    render_signal_chart,
+    render_advanced_signals,
+    render_orb_signals
 )
 from app.tradingview import (
     generate_tradingview_chart_url,
@@ -577,8 +579,63 @@ def main():
             period_options = ["1d", "5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "all"]
             period = st.selectbox("Select Period", period_options, index=3)
             
+            # Add single day trading mode option
+            st.divider()
+            single_day_mode = st.checkbox("Single Day Trading Mode", value=False, 
+                                        help="Focus analysis on a single trading day with intraday patterns")
+            
+            if single_day_mode:
+                st.info("Single day mode focuses on intraday trading strategies")
+                
+            # Add SPY day trading mode option
+            spy_day_trading_mode = st.checkbox("SPY Day Trading Mode", value=False,
+                                           help="Use optimized parameters for SPY day trading")
+            
+            if spy_day_trading_mode:
+                st.info("Using SPY-specific configuration for optimal day trading")
+                
             # Fetch data button
             fetch_data_button = st.button("Fetch Data", use_container_width=True)
+            
+            # Save settings to session state
+            st.session_state['single_day_mode'] = single_day_mode
+            st.session_state['spy_day_trading_mode'] = spy_day_trading_mode
+            
+            if fetch_data_button:
+                with st.spinner(f"Fetching {symbol} data..."):
+                    try:
+                        # If using SPY mode with SPY symbol, use the SPY config
+                        if spy_day_trading_mode and symbol.upper() == "SPY":
+                            try:
+                                from app.config import SPY_CONFIG
+                                from app.signals.spy_strategy import analyze_spy_day_trading
+                                st.session_state['config'] = SPY_CONFIG
+                                st.session_state['use_spy_strategy'] = True
+                                st.success(f"Using optimized SPY configuration and strategy")
+                            except ImportError:
+                                st.warning("SPY configuration not found. Using default settings.")
+                                st.session_state['use_spy_strategy'] = False
+                        else:
+                            st.session_state['use_spy_strategy'] = False
+                        
+                        # Load data based on selected source
+                        if data_source == "Sample Data":
+                            st.session_state.data = load_sample_data(symbol, timeframe, period)
+                        else:
+                            st.session_state.data = fetch_data(symbol, exchange, timeframe, period)
+                            if st.session_state.data is None:
+                                st.error(f"Failed to fetch data for {symbol} from Alpaca API. Falling back to sample data.")
+                                st.session_state.data = load_sample_data(symbol, timeframe, period)
+                        
+                        st.session_state.symbol = symbol
+                        st.session_state.timeframe = timeframe
+                        st.session_state.signals = None  # Reset signals when new data is loaded
+                        
+                        # Show success message for data loading
+                        st.success(f"Successfully loaded {symbol} data for {timeframe} timeframe")
+                    except Exception as e:
+                        st.error(f"Error loading data: {str(e)}")
+                        st.session_state.data = None
             
             # Add Alpaca API configuration button
             if st.button("Configure API Keys"):
@@ -636,28 +693,6 @@ def main():
         )
         st.sidebar.markdown("v1.0.1 | [Source Code](https://github.com/yourusername/day-trade-helper)")
 
-    # Initialize or get session state for data
-    if 'data' not in st.session_state or fetch_data_button:
-        try:
-            # Use real or sample data based on selection
-            if data_source == "Alpaca API":
-                st.session_state.data = fetch_data(symbol, exchange, timeframe, period)
-                if st.session_state.data is None:
-                    st.error(f"Failed to fetch data for {symbol} from Alpaca API. Falling back to sample data.")
-                    st.session_state.data = load_sample_data(symbol, timeframe, period)
-            else:
-                st.session_state.data = load_sample_data(symbol, timeframe, period)
-                
-            st.session_state.symbol = symbol
-            st.session_state.timeframe = timeframe
-            st.session_state.signals = None  # Reset signals when new data is loaded
-            
-            # Show success message for data loading
-            st.success(f"Successfully loaded {symbol} data for {timeframe} timeframe")
-        except Exception as e:
-            st.error(f"Error loading data: {str(e)}")
-            st.session_state.data = None
-    
     # Create tabs for different content areas
     if 'data' in st.session_state and st.session_state.data is not None:
         # Fix for 'bool' object has no attribute 'empty'
@@ -665,7 +700,8 @@ def main():
             st.error("Invalid data format. Please try again.")
             return
             
-        tabs = st.tabs(["Dashboard", "Signals", "Position Sizing", "Backtest"])
+        # Add Single Day Analysis tab to the UI
+        tabs = st.tabs(["Dashboard", "Signals", "ORB Analysis", "Single Day Analysis", "Position Sizing", "Backtest"])
         
         # Tab 1: Dashboard - Consolidated view, no duplicate subsections
         with tabs[0]:
@@ -706,6 +742,7 @@ def main():
             try:
                 signals = generate_signals(st.session_state.data)
                 if signals is not None and not isinstance(signals, bool):
+                    # Check if signals DataFrame is not empty before accessing the last row
                     latest_signal = signals.iloc[-1] if not signals.empty else None
                     if latest_signal is not None:
                         signal_col1, signal_col2 = st.columns(2)
@@ -726,19 +763,295 @@ def main():
             except Exception as e:
                 st.warning(f"Could not generate signals: {str(e)}")
         
-        # Tab 2: Signals - Detailed signal information
+        # Tab 2: Signals
         with tabs[1]:
-            st.header("Signal Analysis")
+            # Generate signals if they don't exist
+            if 'signals' not in st.session_state or st.session_state.signals is None:
+                try:
+                    # Apply market hours filter if selected
+                    data_for_signals = st.session_state.data
+                    
+                    # Check if market hours filter is enabled
+                    if market_hours_filter:
+                        # Get only market hours data using the is_market_hours function
+                        from app.signals.generator import is_market_hours
+                        market_hours_mask = [is_market_hours(idx) for idx in data_for_signals.index]
+                        data_for_signals = data_for_signals.iloc[market_hours_mask]
+                        st.info(f"Filtered data to market hours only: {len(data_for_signals)} data points")
+                    
+                    st.session_state.signals = generate_signals(data_for_signals)
+                    # Store the filter status and count in session state
+                    st.session_state.market_hours_filter_active = market_hours_filter
+                    st.session_state.filtered_data_count = len(data_for_signals)
+                    st.session_state.original_data_count = len(st.session_state.data)
+                except Exception as e:
+                    st.error(f"Error generating signals: {str(e)}")
+                    st.session_state.signals = None
             
-            # Display detailed signals information
-            try:
-                render_signals(st.session_state.data)
-            except Exception as e:
-                st.error(f"Error rendering signals: {str(e)}")
-                st.info("Try adjusting your data timeframe or checking signal generation settings.")
+            if 'signals' in st.session_state and st.session_state.signals is not None:
+                # Display market hours filter status
+                if hasattr(st.session_state, 'market_hours_filter_active') and st.session_state.market_hours_filter_active:
+                    filtered_count = getattr(st.session_state, 'filtered_data_count', 0)
+                    original_count = getattr(st.session_state, 'original_data_count', 0)
+                    percent_kept = (filtered_count / original_count * 100) if original_count > 0 else 0
+                    st.info(f"🕙 Market hours filter is active: Using {filtered_count} of {original_count} data points ({percent_kept:.1f}%)")
+                
+                render_signals(st.session_state.data, st.session_state.signals, st.session_state.symbol)
+                st.subheader("Advanced Signal Analysis")
+                render_advanced_signals(st.session_state.data, st.session_state.signals, st.session_state.symbol)
+            else:
+                st.warning("No signal data available")
         
-        # Tab 3: Position Sizing
+        # Tab 3: ORB Analysis
         with tabs[2]:
+            st.header("Opening Range Breakout (ORB) Analysis")
+            # Generate signals if they don't exist
+            if 'signals' not in st.session_state or st.session_state.signals is None:
+                try:
+                    # Apply market hours filter if selected
+                    data_for_signals = st.session_state.data
+                    
+                    # Check if market hours filter is enabled
+                    if market_hours_filter:
+                        # Get only market hours data using the is_market_hours function
+                        from app.signals.generator import is_market_hours
+                        market_hours_mask = [is_market_hours(idx) for idx in data_for_signals.index]
+                        data_for_signals = data_for_signals.iloc[market_hours_mask]
+                        
+                        # Store the filter status and count in session state
+                        st.session_state.market_hours_filter_active = market_hours_filter
+                        st.session_state.filtered_data_count = len(data_for_signals)
+                        st.session_state.original_data_count = len(st.session_state.data)
+                    
+                    st.session_state.signals = generate_signals(data_for_signals)
+                except Exception as e:
+                    st.error(f"Error generating signals: {str(e)}")
+                    st.session_state.signals = None
+            
+            if 'signals' in st.session_state and st.session_state.signals is not None:
+                # Display market hours filter status
+                if hasattr(st.session_state, 'market_hours_filter_active') and st.session_state.market_hours_filter_active:
+                    filtered_count = getattr(st.session_state, 'filtered_data_count', 0)
+                    original_count = getattr(st.session_state, 'original_data_count', 0)
+                    percent_kept = (filtered_count / original_count * 100) if original_count > 0 else 0
+                    st.info(f"🕙 Market hours filter is active: Using {filtered_count} of {original_count} data points ({percent_kept:.1f}%)")
+                
+                render_orb_signals(st.session_state.data, st.session_state.signals, st.session_state.symbol)
+                
+                # Show explanation of ORB strategy
+                with st.expander("About Opening Range Breakout (ORB) Strategy"):
+                    st.write("""
+                    The Opening Range Breakout (ORB) is a popular day trading strategy that focuses on the price action during the first few minutes after market open.
+                    
+                    **Key Concepts:**
+                    - The opening range is defined as the high and low prices during the first 5-15 minutes of trading.
+                    - A breakout occurs when price moves above the high (bullish) or below the low (bearish) of the opening range.
+                    - These breakouts often signal the direction of the day's trend.
+                    
+                    **Trading Rules:**
+                    - **Buy Signal:** When price breaks above the opening range high
+                    - **Sell Signal:** When price breaks below the opening range low
+                    - **Stop Loss:** Typically placed on the opposite side of the opening range
+                    - **Target:** 1.5 to 2 times the size of the opening range
+                    
+                    This strategy works best on volatile stocks with sufficient volume during the opening minutes.
+                    """)
+            else:
+                st.warning("No signal data available")
+        
+        # Tab 4: Single Day Analysis (NEW)
+        with tabs[3]:
+            st.header(f"Single Day Analysis: {st.session_state.symbol}")
+            
+            # Run single day analysis
+            try:
+                # Import analyze_single_day function
+                from app.signals.generator import analyze_single_day
+                
+                # Filter data to most recent day if not already filtered
+                data_for_analysis = st.session_state.data
+                
+                # Run analysis and display results
+                with st.spinner("Analyzing single day data..."):
+                    results = analyze_single_day(data_for_analysis, st.session_state.symbol)
+                
+                if results["success"]:
+                    # Display basic stats
+                    analysis_data = results["data"]
+                    
+                    # Create summary section
+                    st.subheader("Session Summary")
+                    cols = st.columns(3)
+                    
+                    # Session data metrics
+                    if "session_data" in analysis_data:
+                        session_data = analysis_data["session_data"]
+                        
+                        # Regular hours session
+                        if "regular_hours" in session_data:
+                            reg_hours = session_data["regular_hours"]
+                            with cols[0]:
+                                st.metric("Regular Hours Range", 
+                                          f"${reg_hours.get('low', 0):.2f} - ${reg_hours.get('high', 0):.2f}" if reg_hours else "N/A")
+                                
+                        # Pre-market session
+                        if "pre_market" in session_data:
+                            pre_market = session_data["pre_market"]
+                            with cols[1]:
+                                if pre_market and 'close' in pre_market and 'open' in pre_market:
+                                    change = pre_market['close'] - pre_market['open']
+                                    st.metric("Pre-Market", 
+                                             f"${pre_market.get('close', 0):.2f}", 
+                                             f"{change:.2f}" if change else None)
+                                else:
+                                    st.metric("Pre-Market", "N/A")
+                                    
+                        # Last price info
+                        with cols[2]:
+                            last_close = analysis_data.get("last_close")
+                            if last_close:
+                                st.metric("Last Close", f"${last_close:.2f}")
+                    
+                    # Opening range information
+                    st.subheader("Opening Range")
+                    if "opening_range" in analysis_data:
+                        or_data = analysis_data["opening_range"]
+                        or_cols = st.columns(3)
+                        
+                        with or_cols[0]:
+                            st.metric("ORB High", f"${or_data.get('high', 0):.2f}")
+                        with or_cols[1]:
+                            st.metric("ORB Low", f"${or_data.get('low', 0):.2f}")
+                        with or_cols[2]:
+                            range_size = or_data.get('high', 0) - or_data.get('low', 0)
+                            st.metric("Range Size", f"${range_size:.2f}")
+                    
+                    # Signal information
+                    st.subheader("Trading Signals")
+                    if "signal_rows" in analysis_data and not analysis_data["signal_rows"].empty:
+                        signal_rows = analysis_data["signal_rows"]
+                        
+                        # Display signal metrics
+                        buy_signals = signal_rows['buy_signal'].sum()
+                        sell_signals = signal_rows['sell_signal'].sum()
+                        signal_cols = st.columns(2)
+                        
+                        with signal_cols[0]:
+                            st.metric("Buy Signals", f"{buy_signals}")
+                        with signal_cols[1]:
+                            st.metric("Sell Signals", f"{sell_signals}")
+                        
+                        # Show signals table
+                        if not signal_rows.empty:
+                            st.write("Signal Details:")
+                            
+                            # Create a clean display table
+                            display_df = signal_rows.copy()
+                            
+                            if 'signal_time' in display_df.columns:
+                                display_df['time'] = display_df['signal_time'].dt.strftime('%H:%M:%S')
+                            
+                            # Calculate the signal type
+                            def get_signal_type(row):
+                                if row['buy_signal']:
+                                    return "BUY"
+                                elif row['sell_signal']:
+                                    return "SELL"
+                                else:
+                                    return "NEUTRAL"
+                                
+                            display_df['signal'] = display_df.apply(get_signal_type, axis=1)
+                            
+                            # Calculate R:R ratio
+                            def calculate_rr(row):
+                                if row['buy_signal'] and row['signal_price'] > 0 and row['target_price'] > 0 and row['stop_loss'] > 0:
+                                    risk = row['signal_price'] - row['stop_loss']
+                                    reward = row['target_price'] - row['signal_price']
+                                    if risk > 0:
+                                        return reward / risk
+                                elif row['sell_signal'] and row['signal_price'] > 0 and row['target_price'] > 0 and row['stop_loss'] > 0:
+                                    risk = row['stop_loss'] - row['signal_price']
+                                    reward = row['signal_price'] - row['target_price']
+                                    if risk > 0:
+                                        return reward / risk
+                                return None
+                            
+                            display_df['r_r_ratio'] = display_df.apply(calculate_rr, axis=1)
+                            
+                            # Select and rename columns for display
+                            display_columns = ['time', 'signal', 'signal_price', 'target_price', 'stop_loss', 'r_r_ratio', 'signal_strength']
+                            display_columns = [col for col in display_columns if col in display_df.columns]
+                            
+                            # Display the table
+                            st.dataframe(display_df[display_columns], use_container_width=True)
+                            
+                            # Plot signals on a chart
+                            st.subheader("Signal Chart")
+                            import plotly.graph_objects as go
+                            
+                            fig = go.Figure()
+                            
+                            # Add candlesticks
+                            fig.add_trace(go.Candlestick(
+                                x=data_for_analysis.index,
+                                open=data_for_analysis['open'],
+                                high=data_for_analysis['high'],
+                                low=data_for_analysis['low'],
+                                close=data_for_analysis['close'],
+                                name='Price'
+                            ))
+                            
+                            # Add buy signals
+                            buy_points = signal_rows[signal_rows['buy_signal']]
+                            if not buy_points.empty:
+                                fig.add_trace(go.Scatter(
+                                    x=buy_points.index,
+                                    y=buy_points['signal_price'],
+                                    mode='markers',
+                                    marker=dict(color='green', size=12, symbol='triangle-up'),
+                                    name='Buy Signal'
+                                ))
+                                
+                            # Add sell signals
+                            sell_points = signal_rows[signal_rows['sell_signal']]
+                            if not sell_points.empty:
+                                fig.add_trace(go.Scatter(
+                                    x=sell_points.index,
+                                    y=sell_points['signal_price'],
+                                    mode='markers',
+                                    marker=dict(color='red', size=12, symbol='triangle-down'),
+                                    name='Sell Signal'
+                                ))
+                            
+                            # Update layout
+                            fig.update_layout(
+                                title=f'{st.session_state.symbol} Single Day Analysis',
+                                yaxis_title='Price',
+                                xaxis_title='Time',
+                                xaxis_rangeslider_visible=False,
+                                height=600
+                            )
+                            
+                            st.plotly_chart(fig, use_container_width=True)
+                            
+                    else:
+                        st.info("No signals detected for this time period")
+                    
+                    # Show full day data if requested
+                    if "signals" in analysis_data:
+                        with st.expander("Show All Data Points"):
+                            st.dataframe(analysis_data["signals"], use_container_width=True)
+                    
+                else:
+                    st.error(f"Analysis failed: {results.get('error', 'Unknown error')}")
+                    
+            except Exception as e:
+                st.error(f"Error in single day analysis: {str(e)}")
+                import traceback
+                st.exception(e)
+        
+        # Tab 5: Position Sizing
+        with tabs[4]:
             # Risk management calculator
             render_risk_calculator(
                 st.session_state.data.iloc[-1]['close'],
@@ -747,8 +1060,8 @@ def main():
                 take_profit_ratio
             )
         
-        # Tab 4: Backtest
-        with tabs[3]:
+        # Tab 6: Backtest
+        with tabs[5]:
             # Backtesting functionality - use a wrapper to provide a temporary UI
             st.header("Backtesting")
             st.info("Choose a strategy and timeframe to backtest your trading signals.")

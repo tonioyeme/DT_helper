@@ -7,10 +7,13 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from typing import Dict
 import plotly.express as px
+import traceback
+import matplotlib.pyplot as plt
 
 from app.signals import generate_signals, SignalStrength
 from app.signals.generator import create_default_signal_generator, generate_signals_advanced
 from app.signals.timeframes import TimeFrame, TimeFramePriority
+from app.indicators import calculate_opening_range
 
 def is_market_hours(timestamp):
     """
@@ -353,15 +356,19 @@ def render_signal_table(data):
         st.metric("EMA+VWAP Signals", ema_vwap_count)
         st.metric("MM+Volume Signals", mm_vol_count)
 
-def render_signals(data, signal_data=None):
+def render_signals(data, signal_data=None, symbol=None):
     """
     Render signal data with visualization and detailed information
     
     Args:
         data: DataFrame with price data
         signal_data: Optional pre-calculated signal data (if None, will be calculated)
+        symbol: Trading symbol being analyzed (optional)
     """
     st.header("Signal Analysis")
+    
+    if symbol:
+        st.subheader(f"Symbol: {symbol}")
     
     if signal_data is None:
         if data is not None:
@@ -624,19 +631,24 @@ def render_signal_chart(data, signals, symbol):
     
     return fig 
 
-def render_advanced_signals(data_dict: Dict[str, pd.DataFrame], primary_tf: str = None) -> None:
+def render_advanced_signals(data_dict: Dict[str, pd.DataFrame], primary_tf: str = None, symbol: str = None) -> None:
     """
     Render advanced signals visualization with component scores, market regime, and multi-timeframe confirmation
     
     Args:
         data_dict: Dictionary mapping timeframe names to price DataFrames
         primary_tf: Primary timeframe to use (defaults to shortest available)
+        symbol: Trading symbol being analyzed (optional)
     """
     if not data_dict or not isinstance(data_dict, dict):
         st.error("No data available for signal analysis")
         return
     
     try:
+        # Display symbol if provided
+        if symbol:
+            st.subheader(f"Advanced Signal Analysis: {symbol}")
+            
         # Import the advanced signal generation function
         from app.signals.generator import generate_signals_advanced
         
@@ -780,12 +792,54 @@ def render_advanced_signals(data_dict: Dict[str, pd.DataFrame], primary_tf: str 
             strength_text = f" ({strength_map.get(strength_value, '')})"
         
         # Display the signal in a big, colored box
+        signal_text = f"{signal_type}{strength_text}"
+
+        # Check if the signal is strong
+        is_strong_signal = False
+        strong_badge = ""
+
+        # Check for strong signals from either source
+        if multi_tf_data and 'signal_strength' in multi_tf_data:
+            is_strong_signal = (multi_tf_data['signal_strength'] >= 3)
+        elif 'signal_strength' in signals.columns:
+            is_strong_signal = (signals['signal_strength'].iloc[-1] >= 3)
+
+        # Check for high score
+        has_high_score = False
+        if signal_type == "BUY" and 'buy_score' in signals.columns:
+            has_high_score = signals['buy_score'].iloc[-1] >= 0.75
+        elif signal_type == "SELL" and 'sell_score' in signals.columns:
+            has_high_score = signals['sell_score'].iloc[-1] >= 0.75
+
+        # Add strong badge if this is a strong signal
+        if is_strong_signal or has_high_score:
+            strong_badge = '<span style="background-color: yellow; color: black; padding: 3px 8px; border-radius: 4px; margin-left: 10px; font-size: 0.8em;">⭐ STRONG</span>'
+            # Use a darker, more vibrant color for strong signals
+            if signal_type == "BUY":
+                signal_color = "#006400"  # Dark green
+            elif signal_type == "SELL":
+                signal_color = "#8B0000"  # Dark red
+
+        # Get score values
+        buy_score = signals['buy_score'].iloc[-1] if 'buy_score' in signals.columns else 0
+        sell_score = signals['sell_score'].iloc[-1] if 'sell_score' in signals.columns else 0
+        score_to_show = buy_score if signal_type == "BUY" else sell_score if signal_type == "SELL" else 0.5
+        score_pct = int(score_to_show * 100)
+
+        # Enhanced display with score visualization
+        score_bar = f"""
+        <div style="background-color: #eee; border-radius: 5px; height: 15px; width: 100%; margin-top: 10px;">
+            <div style="background-color: {'green' if signal_type == 'BUY' else 'red' if signal_type == 'SELL' else 'gray'}; width: {score_pct}%; height: 100%; border-radius: 5px;"></div>
+        </div>
+        """
+
         st.markdown(
             f"""
-            <div style="padding: 20px; background-color: {signal_color}; color: white; border-radius: 10px; text-align: center;">
-                <h1>{signal_type}{strength_text}</h1>
-                <h2>Score: {score_pct}%</h2>
-                <p style="font-size: 0.8em; margin-top: 5px;">Signals only calculated during market hours (9:30 AM - 4:00 PM ET, Mon-Fri)</p>
+            <div style="padding: 20px; background-color: {signal_color}; color: white; border-radius: 10px; text-align: center; box-shadow: 0 4px 8px rgba(0,0,0,0.1);">
+                <h1>{signal_text} {strong_badge}</h1>
+                <h3>Signal Score: {score_pct}%</h3>
+                {score_bar}
+                <p style="font-size: 0.8em; margin-top: 15px;">Signals only calculated during market hours (9:30 AM - 4:00 PM ET, Mon-Fri)</p>
             </div>
             """, 
             unsafe_allow_html=True
@@ -838,6 +892,91 @@ def render_advanced_signals(data_dict: Dict[str, pd.DataFrame], primary_tf: str 
                         unsafe_allow_html=True
                     )
             
+            # Generate Signal Components Chart
+            st.subheader("Signal Components")
+            
+            # Extract indicator components from the latest signals
+            latest_row = signals.iloc[-1]
+            components = {}
+            
+            # Define indicator components to look for
+            indicator_components = [
+                # EMA-related indicators
+                ('EMA Trend', ['ema_cloud_cross_bullish', 'ema_cloud_cross_bearish']),
+                ('Price-EMA', ['price_cross_above_ema20', 'price_cross_below_ema20', 'price_above_ema50', 'price_below_ema50']),
+                # MACD
+                ('MACD', ['macd_cross_above_signal', 'macd_cross_below_signal', 'macd_above_zero', 'macd_below_zero']),
+                # RSI
+                ('RSI', ['rsi_oversold', 'rsi_overbought', 'rsi_reversal_bullish', 'rsi_reversal_bearish']),
+                # Stochastic
+                ('Stochastic', ['stochastic_oversold', 'stochastic_overbought', 'stochastic_k_cross_above_d', 'stochastic_k_cross_below_d']),
+                # VWAP
+                ('VWAP', ['price_above_vwap', 'price_below_vwap', 'price_cross_above_vwap', 'price_cross_below_vwap']),
+                # Volume
+                ('Volume', ['volume_spike', 'above_avg_volume', 'volume_increasing']),
+                # Patterns
+                ('Patterns', ['hammer', 'shooting_star', 'bullish_engulfing', 'bearish_engulfing', 'morning_star', 'evening_star']),
+                # ORB
+                ('ORB', ['orb_signal'])
+            ]
+            
+            # Extract component values
+            component_values = []
+            component_names = []
+            
+            for category, indicators in indicator_components:
+                # Sum all indicators in this category that are True
+                category_sum = 0
+                indicators_found = False
+                
+                for ind in indicators:
+                    if ind in latest_row:
+                        # If indicator is boolean, use 1 for True
+                        if isinstance(latest_row[ind], bool):
+                            category_sum += 1 if latest_row[ind] else 0
+                            indicators_found = indicators_found or latest_row[ind]
+                        # If it's a numeric score, use the value directly
+                        elif pd.notna(latest_row[ind]) and isinstance(latest_row[ind], (int, float)):
+                            category_sum += latest_row[ind]
+                            indicators_found = indicators_found or (latest_row[ind] > 0)
+                
+                # Only add components that have at least one active indicator
+                if indicators_found:
+                    component_names.append(category)
+                    component_values.append(category_sum)
+            
+            # If no components found, show default message
+            if not component_names:
+                st.info("No detailed signal components available")
+            else:
+                # Determine colors based on signal type
+                colors = ['green'] * len(component_names) if signal_type == "BUY" else ['red'] * len(component_names) if signal_type == "SELL" else ['gray'] * len(component_names)
+                
+                try:
+                    # Create horizontal bar chart
+                    fig = go.Figure()
+                    fig.add_trace(go.Bar(
+                        y=component_names,
+                        x=component_values,
+                        orientation='h',
+                        marker=dict(
+                            color=colors,
+                            line=dict(color='rgba(0, 0, 0, 0.2)', width=1)
+                        )
+                    ))
+                    
+                    fig.update_layout(
+                        title="Indicator Component Contributions",
+                        xaxis_title="Contribution Strength",
+                        yaxis_title="Indicator",
+                        height=400,
+                        margin=dict(l=10, r=10, t=40, b=30)
+                    )
+                    
+                    st.plotly_chart(fig, use_container_width=True)
+                except Exception as e:
+                    st.error(f"Error creating component chart: {str(e)}")
+            
             # Display multi-timeframe confirmation and conflicts
             if 'confirmed_by' in multi_tf_data and multi_tf_data['confirmed_by']:
                 confirmations = [conf.get('timeframe') for conf in multi_tf_data['confirmed_by']]
@@ -862,259 +1001,197 @@ def render_advanced_signals(data_dict: Dict[str, pd.DataFrame], primary_tf: str 
                         """,
                         unsafe_allow_html=True
                     )
-        else:
-            # Fallback to basic confidence display
-            if 'confidence' in signals.columns:
-                confidence = signals['confidence'].iloc[-1]
-                conf_pct = int(confidence * 100)
-                
-                st.markdown(
-                    f"""
-                    <div style="padding: 10px; background-color: #f0f0f0; border-radius: 5px; margin-top: 10px;">
-                        <h3>Confidence: {conf_pct}%</h3>
-                    </div>
-                    """,
-                    unsafe_allow_html=True
-                )
-        
-        # Display multi-timeframe signals table if available
-        if multi_tf_data and 'weighted_signals' in multi_tf_data:
-            st.subheader("Multi-Timeframe Analysis")
-            
-            weighted_signals = multi_tf_data['weighted_signals']
-            
-            tf_data_rows = []
-            for tf_name, tf_data in weighted_signals.items():
-                signals_data = tf_data['signals']
-                weight = tf_data['weight']
-                
-                # Extract signal direction
-                signal_direction = "Neutral"
-                if signals_data.get('buy_signal', False):
-                    signal_direction = "Buy"
-                elif signals_data.get('sell_signal', False):
-                    signal_direction = "Sell"
-                
-                # Extract score (use appropriate field or fallback to default)
-                score = signals_data.get('buy_score', 0) if signal_direction == "Buy" else signals_data.get('sell_score', 0) if signal_direction == "Sell" else 0
-                
-                tf_data_rows.append({
-                    "Timeframe": tf_name,
-                    "Signal": signal_direction,
-                    "Score": f"{int(score * 100)}%" if signal_direction != "Neutral" else "-",
-                    "Weight": f"{weight:.1f}"
-                })
-            
-            if tf_data_rows:
-                tf_df = pd.DataFrame(tf_data_rows)
-                
-                # Add styling to the dataframe
-                def highlight_signal(val):
-                    color = 'white'
-                    if val == 'Buy':
-                        color = '#d4f7d4'  # Light green
-                    elif val == 'Sell':
-                        color = '#f7d4d4'  # Light red
-                    return f'background-color: {color}'
-                
-                st.dataframe(
-                    tf_df.style.applymap(highlight_signal, subset=['Signal']),
-                    use_container_width=True
-                )
-        
-        # Show signal components in a horizontal bar chart
-        st.subheader("Signal Components")
-        
-        # First check for component scores in multi-timeframe data
-        component_scores = {}
-        if multi_tf_data and 'component_scores' in multi_tf_data:
-            component_scores = multi_tf_data['component_scores']
-        # Then fallback to checking the signals dataframe
-        else:
-            for component in ['trend_score', 'momentum_score', 'volume_score', 'volatility_score']:
-                if component in signals.columns:
-                    component_scores[component.replace('_score', '').title()] = signals[component].iloc[-1]
-        
-        if component_scores:
-            # Create dataframe for visualization
-            components = list(component_scores.keys())
-            scores = list(component_scores.values())
-            
-            component_df = pd.DataFrame({
-                'Component': [key.replace('_score', '').title() for key in components],
-                'Score': scores
-            })
-            
-            # Create bar chart with custom colors based on score
-            fig = px.bar(
-                component_df, 
-                x='Score', 
-                y='Component',
-                orientation='h',
-                color='Score',
-                color_continuous_scale=[(0, "red"), (0.5, "yellow"), (1, "green")],
-                range_color=[0, 1]
-            )
-            
-            fig.update_layout(
-                height=300,
-                margin=dict(l=0, r=0, t=30, b=0),
-                title_text="Component Contribution",
-                coloraxis_showscale=False
-            )
-            
-            st.plotly_chart(fig, use_container_width=True)
-        
-        # Show signal metrics over time
-        st.subheader("Signal History")
-        
-        # Define date filtering for signal history
-        col1, col2 = st.columns(2)
-        with col1:
-            last_n_days = st.selectbox(
-                "Show signals from last:", 
-                [1, 3, 5, 7, 14, 30, "All"], 
-                index=2
-            )
-        
-        with col2:
-            signal_filter = st.multiselect(
-                "Filter signals:", 
-                ["Buy", "Sell", "Neutral"], 
-                default=["Buy", "Sell"]
-            )
-            
-        # Filter signals based on user selection
-        filtered_signals = signals.copy()
-        
-        if last_n_days != "All":
-            start_date = pd.Timestamp.now(tz='UTC') - pd.Timedelta(days=int(last_n_days))
-            filtered_signals = filtered_signals[filtered_signals.index >= start_date]
-            
-        # Filter by signal type
-        buy_filter = "Buy" in signal_filter
-        sell_filter = "Sell" in signal_filter
-        neutral_filter = "Neutral" in signal_filter
-        
-        signal_mask = pd.Series(False, index=filtered_signals.index)
-        
-        if buy_filter and 'buy_signal' in filtered_signals.columns:
-            signal_mask = signal_mask | filtered_signals['buy_signal']
-            
-        if sell_filter and 'sell_signal' in filtered_signals.columns:
-            signal_mask = signal_mask | filtered_signals['sell_signal']
-            
-        if neutral_filter:
-            # Define neutral as neither buy nor sell
-            if 'buy_signal' in filtered_signals.columns and 'sell_signal' in filtered_signals.columns:
-                neutral_mask = ~(filtered_signals['buy_signal'] | filtered_signals['sell_signal'])
-                signal_mask = signal_mask | neutral_mask
-                
-        filtered_signals = filtered_signals[signal_mask]
-        
-        # Display signal history visualization
-        if not filtered_signals.empty:
-            # Create a line chart with the signal score over time
-            chart_data = pd.DataFrame(index=filtered_signals.index)
-            
-            # Add score column if it exists
-            if 'score' in filtered_signals.columns:
-                chart_data['score'] = filtered_signals['score']
-            
-            # Add component scores if available
-            for component in ['trend_score', 'momentum_score', 'volume_score', 'volatility_score']:
-                if component in filtered_signals.columns:
-                    chart_data[component] = filtered_signals[component]
+            else:
+                # Fallback to basic confidence display
+                if 'confidence' in signals.columns:
+                    confidence = signals['confidence'].iloc[-1]
+                    conf_pct = int(confidence * 100)
                     
-            # Rename columns for better display
-            chart_data.columns = [col.replace('_score', '').title() for col in chart_data.columns]
-            
-            # Create a Plotly figure
-            fig = px.line(
-                chart_data,
-                labels={"value": "Score", "variable": "Component", "index": "Date"},
-                title="Signal Score History"
-            )
-            
-            # Add buy/sell signals as markers
-            if 'buy_signal' in filtered_signals.columns:
-                buy_points = filtered_signals[filtered_signals['buy_signal'] == True]
-                if not buy_points.empty and 'score' in buy_points.columns:
-                    fig.add_scatter(
-                        x=buy_points.index,
-                        y=buy_points['score'],
-                        mode='markers',
-                        marker=dict(color='green', size=12, symbol='triangle-up'),
-                        name='Buy Signal'
-                    )
-                    
-            if 'sell_signal' in filtered_signals.columns:
-                sell_points = filtered_signals[filtered_signals['sell_signal'] == True]
-                if not sell_points.empty and 'score' in sell_points.columns:
-                    fig.add_scatter(
-                        x=sell_points.index,
-                        y=sell_points['score'],
-                        mode='markers',
-                        marker=dict(color='red', size=12, symbol='triangle-down'),
-                        name='Sell Signal'
+                    st.markdown(
+                        f"""
+                        <div style="padding: 10px; background-color: #f0f0f0; border-radius: 5px; margin-top: 10px;">
+                            <h3>Confidence: {conf_pct}%</h3>
+                        </div>
+                        """,
+                        unsafe_allow_html=True
                     )
             
-            # Add thresholds if possible to find them
-            try:
-                # Add buy threshold line
-                buy_signals = filtered_signals[filtered_signals['buy_signal'] == True]
-                if not buy_signals.empty and 'score' in buy_signals.columns:
-                    min_buy_score = buy_signals['score'].min()
-                    if min_buy_score > 0:
-                        fig.add_hline(
-                            y=min_buy_score,
-                            line=dict(color="green", width=1, dash="dot"),
-                            annotation_text="Buy Threshold"
-                        )
+            # Display multi-timeframe signals table if available
+            if multi_tf_data and 'weighted_signals' in multi_tf_data:
+                st.subheader("Multi-Timeframe Analysis")
                 
-                # Add sell threshold line
-                sell_signals = filtered_signals[filtered_signals['sell_signal'] == True]
-                if not sell_signals.empty and 'score' in sell_signals.columns:
-                    max_sell_score = sell_signals['score'].max()
-                    if max_sell_score < 1:
-                        fig.add_hline(
-                            y=max_sell_score,
-                            line=dict(color="red", width=1, dash="dot"),
-                            annotation_text="Sell Threshold"
-                        )
-            except Exception as e:
-                pass  # Ignore threshold errors
-            
-            fig.update_layout(height=400)
-            st.plotly_chart(fig, use_container_width=True)
-            
-            # Display table with detailed signal information
-            st.subheader("Signal Details")
-            
-            # Create a display DataFrame with key columns
-            display_cols = ['signal_time_et', 'signal_price', 'score']
-            if 'signal_strength' in filtered_signals.columns:
-                display_cols.append('signal_strength')
-            if 'market_regime' in filtered_signals.columns:
-                display_cols.append('market_regime')
-            
-            display_df = filtered_signals[display_cols].copy()
-            
-            # Add signal type column
-            if 'buy_signal' in filtered_signals.columns and 'sell_signal' in filtered_signals.columns:
-                display_df['signal'] = 'Neutral'
-                display_df.loc[filtered_signals['buy_signal'], 'signal'] = 'Buy'
-                display_df.loc[filtered_signals['sell_signal'], 'signal'] = 'Sell'
-            
-            # Rename columns for display
-            display_df.columns = [col.replace('_', ' ').title() for col in display_df.columns]
-            
-            # Sort by time (most recent first)
-            display_df = display_df.sort_index(ascending=False)
-            
-            st.dataframe(display_df, use_container_width=True)
-        else:
-            st.warning("No signals match the selected filters")
-        
+                weighted_signals = multi_tf_data['weighted_signals']
+                
+                tf_data_rows = []
+                for tf_name, tf_data in weighted_signals.items():
+                    signals_data = tf_data['signals']
+                    weight = tf_data['weight']
+                    
+                    # Extract signal direction
+                    signal_direction = "Neutral"
+                    if signals_data.get('buy_signal', False):
+                        signal_direction = "Buy"
+                    elif signals_data.get('sell_signal', False):
+                        signal_direction = "Sell"
+                    
+                    # Extract score (use appropriate field or fallback to default)
+                    score = signals_data.get('buy_score', 0) if signal_direction == "Buy" else signals_data.get('sell_score', 0) if signal_direction == "Sell" else 0
+                    
+                    tf_data_rows.append({
+                        "Timeframe": tf_name,
+                        "Signal": signal_direction,
+                        "Score": f"{int(score * 100)}%" if signal_direction != "Neutral" else "-",
+                        "Weight": f"{weight:.1f}"
+                    })
+                
+                # Ensure we have data before creating a DataFrame
+                if len(tf_data_rows) > 0:
+                    tf_df = pd.DataFrame(tf_data_rows)
+                    
+                    # Add styling to the dataframe
+                    def highlight_signal(val):
+                        color = 'white'
+                        if val == 'Buy':
+                            color = '#d4f7d4'  # Light green
+                        elif val == 'Sell':
+                            color = '#f7d4d4'  # Light red
+                        return f'background-color: {color}'
+                    
+                    st.dataframe(
+                        tf_df.style.applymap(highlight_signal, subset=['Signal']),
+                        use_container_width=True
+                    )
     except Exception as e:
         st.error(f"Error rendering advanced signals: {str(e)}") 
+
+def render_orb_signals(data, signals, symbol):
+    """
+    Render Opening Range Breakout signals visualization
+    
+    Args:
+        data (pd.DataFrame): Price data
+        signals (pd.DataFrame): Signals data
+        symbol (str): Trading symbol
+    """
+    st.subheader(f"Opening Range Breakout Analysis: {symbol}")
+    
+    # Check if we have any ORB signals
+    if 'orb_signal' not in signals.columns or not signals['orb_signal'].any():
+        st.warning("No Opening Range Breakout signals detected in this data.")
+        return
+    
+    # Filter to get only the rows with ORB signals
+    orb_data = signals[signals['orb_signal'] == True]
+    
+    # Get the latest ORB signal
+    if len(orb_data) > 0:
+        latest_orb = orb_data.iloc[-1]
+        orb_level = latest_orb.get('orb_level', None)
+        
+        # Create two columns for ORB data
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.metric(
+                "ORB Level", 
+                f"${orb_level:.2f}" if orb_level else "N/A",
+                delta=None
+            )
+            
+            # Get the type of signal
+            if latest_orb.get('buy_signal', False):
+                st.success("⬆️ ORB Bullish Breakout")
+            elif latest_orb.get('sell_signal', False):
+                st.error("⬇️ ORB Bearish Breakdown")
+                
+        with col2:
+            # Calculate stats for the ORB signals
+            orb_win_rate = orb_data['target_reached'].mean() if 'target_reached' in orb_data.columns else None
+            orb_avg_gain = orb_data['gain_loss'].mean() if 'gain_loss' in orb_data.columns else None
+            
+            if orb_win_rate is not None:
+                st.metric("ORB Win Rate", f"{orb_win_rate:.1%}", delta=None)
+            
+            if orb_avg_gain is not None:
+                st.metric("ORB Avg Gain", f"{orb_avg_gain:.2%}", delta=None)
+    
+    # Create a chart of the opening range
+    try:
+        # Ensure we have data in Eastern time
+        eastern = pytz.timezone('US/Eastern')
+        chart_data = data.copy()
+        if chart_data.index.tzinfo is not None:
+            chart_data.index = chart_data.index.tz_convert(eastern)
+        
+        # Calculate opening range
+        orb_high, orb_low = calculate_opening_range(chart_data, minutes=5)
+        
+        # Create a candlestick chart with ORB levels
+        fig = go.Figure()
+        
+        # Add candlesticks
+        fig.add_trace(go.Candlestick(
+            x=chart_data.index,
+            open=chart_data['open'],
+            high=chart_data['high'],
+            low=chart_data['low'],
+            close=chart_data['close'],
+            name='Price'
+        ))
+        
+        # Add ORB high and low levels
+        if orb_high is not None:
+            fig.add_shape(
+                type="line",
+                x0=chart_data.index[0],
+                y0=orb_high,
+                x1=chart_data.index[-1],
+                y1=orb_high,
+                line=dict(color="green", width=2, dash="dash"),
+                name="ORB High"
+            )
+            
+        if orb_low is not None:
+            fig.add_shape(
+                type="line",
+                x0=chart_data.index[0],
+                y0=orb_low,
+                x1=chart_data.index[-1],
+                y1=orb_low,
+                line=dict(color="red", width=2, dash="dash"),
+                name="ORB Low"
+            )
+        
+        # Add breakout points
+        for idx, row in orb_data.iterrows():
+            if row.get('buy_signal', False):
+                fig.add_trace(go.Scatter(
+                    x=[idx],
+                    y=[chart_data.loc[idx, 'high']],
+                    mode='markers',
+                    marker=dict(color='green', size=12, symbol='triangle-up'),
+                    name='ORB Breakout'
+                ))
+            elif row.get('sell_signal', False):
+                fig.add_trace(go.Scatter(
+                    x=[idx],
+                    y=[chart_data.loc[idx, 'low']],
+                    mode='markers',
+                    marker=dict(color='red', size=12, symbol='triangle-down'),
+                    name='ORB Breakdown'
+                ))
+        
+        # Set chart title and labels
+        fig.update_layout(
+            title=f"Opening Range Breakout: {symbol}",
+            xaxis_title="Time",
+            yaxis_title="Price ($)",
+            xaxis_rangeslider_visible=False,
+            height=500
+        )
+        
+        st.plotly_chart(fig, use_container_width=True)
+        
+    except Exception as e:
+        st.error(f"Error rendering ORB chart: {str(e)}")
+        traceback.print_exc() 

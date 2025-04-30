@@ -97,7 +97,7 @@ class AdvancedSignalProcessor:
     
     def detect_market_regime(self, data: pd.DataFrame) -> MarketRegime:
         """
-        Detect current market regime based on price action, volatility, and trend strength
+        Detect current market regime based on ADX and ATR values
         
         Args:
             data: DataFrame with OHLCV and indicator data
@@ -109,75 +109,116 @@ class AdvancedSignalProcessor:
             return MarketRegime.SIDEWAYS  # Default to sideways if insufficient data
         
         try:
-            # Calculate key metrics for regime detection
-            
-            # 1. Trend strength using ADX if available, otherwise use EMA relationships
-            if 'adx' in data.columns:
-                adx_value = data['adx'].iloc[-1]
-                trend_strength = adx_value / 50.0  # Normalize to 0-1 range (ADX max is ~100)
-            else:
-                # Use EMA relationships as a proxy for trend strength
-                ema_short = data['ema20'].iloc[-10:] if 'ema20' in data.columns else data['close'].rolling(20).mean().iloc[-10:]
-                ema_long = data['ema50'].iloc[-10:] if 'ema50' in data.columns else data['close'].rolling(50).mean().iloc[-10:]
+            # Calculate ADX if not already in the dataframe
+            if 'adx' not in data.columns:
+                # Calculate true range
+                high_low = data['high'] - data['low']
+                high_close = abs(data['high'] - data['close'].shift(1))
+                low_close = abs(data['low'] - data['close'].shift(1))
+                tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
                 
-                # Calculate average distance between EMAs as percentage of price
-                avg_distance = abs(ema_short.mean() - ema_long.mean()) / ema_long.mean()
-                trend_strength = min(1.0, avg_distance * 20)  # Scale to 0-1 range
+                # Calculate directional movement
+                plus_dm = data['high'].diff()
+                minus_dm = data['low'].diff()
+                plus_dm[plus_dm < 0] = 0
+                minus_dm[minus_dm > 0] = 0
+                minus_dm = abs(minus_dm)
+                
+                # Smooth DM and TR using Wilder's smoothing method
+                period = 14
+                plus_di = 100 * plus_dm.rolling(window=period).sum() / tr.rolling(window=period).sum()
+                minus_di = 100 * minus_dm.rolling(window=period).sum() / tr.rolling(window=period).sum()
+                
+                # Calculate DX and ADX
+                dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
+                data['adx'] = dx.rolling(window=period).mean()
+                
+                # Also calculate +DI and -DI for directional information
+                data['+di'] = plus_di
+                data['-di'] = minus_di
             
-            # 2. Volatility assessment
-            if 'atr' in data.columns:
-                # Use ATR relative to its moving average
-                recent_atr = data['atr'].iloc[-5:].mean()
-                historical_atr = data['atr'].iloc[-20:].mean()
-                volatility_ratio = recent_atr / historical_atr if historical_atr > 0 else 1.0
-            else:
-                # Calculate simple volatility measure using price range
-                recent_ranges = (data['high'].iloc[-5:] - data['low'].iloc[-5:]) / data['close'].iloc[-5:]
-                historical_ranges = (data['high'].iloc[-20:] - data['low'].iloc[-20:]) / data['close'].iloc[-20:]
-                volatility_ratio = recent_ranges.mean() / historical_ranges.mean() if historical_ranges.mean() > 0 else 1.0
+            # Calculate ATR if not already in the dataframe
+            if 'atr' not in data.columns:
+                high_low = data['high'] - data['low']
+                high_close = abs(data['high'] - data['close'].shift(1))
+                low_close = abs(data['low'] - data['close'].shift(1))
+                tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+                data['atr'] = tr.rolling(window=14).mean()
             
-            # 3. Trend direction
+            # Calculate normalized ATR (as percentage of price)
+            norm_atr = data['atr'] / data['close']
+            current_norm_atr = norm_atr.iloc[-1]
+            
+            # Get historical volatility average (30-day)
+            historical_norm_atr = norm_atr.iloc[-30:].mean()
+            volatility_ratio = current_norm_atr / historical_norm_atr if historical_norm_atr > 0 else 1.0
+            
+            # Get current ADX, +DI, -DI values
+            current_adx = data['adx'].iloc[-1]
+            
+            # Get +DI and -DI if available, otherwise default to 0
+            current_plus_di = data.get('+di', pd.Series(0)).iloc[-1]
+            current_minus_di = data.get('-di', pd.Series(0)).iloc[-1]
+            
+            # Determine trend direction
             if 'ema20' in data.columns and 'ema50' in data.columns:
-                bullish = data['ema20'].iloc[-1] > data['ema50'].iloc[-1]
+                trend_direction = 1 if data['ema20'].iloc[-1] > data['ema50'].iloc[-1] else -1
             else:
-                # Use price relative to moving averages
                 sma20 = data['close'].rolling(20).mean().iloc[-1]
                 sma50 = data['close'].rolling(50).mean().iloc[-1]
-                bullish = sma20 > sma50
+                trend_direction = 1 if sma20 > sma50 else -1
             
-            # 4. Detect potential reversal
-            if 'rsi' in data.columns:
-                overbought = data['rsi'].iloc[-1] > 70
-                oversold = data['rsi'].iloc[-1] < 30
+            # Detect breakout conditions
+            price_range_20d = data['high'].rolling(window=20).max() - data['low'].rolling(window=20).min()
+            avg_range = price_range_20d.iloc[-5:].mean()
+            latest_move = abs(data['close'].iloc[-1] - data['close'].iloc[-5])
+            is_breakout = latest_move > (0.7 * avg_range)
+            
+            # Enhanced regime classification based on ADX and volatility
+            # 1. Strong Trend (ADX > 40)
+            if current_adx > 40:
+                if current_plus_di > current_minus_di:
+                    regime = MarketRegime.BULL_TREND
+                else:
+                    regime = MarketRegime.BEAR_TREND
                 
-                # Divergence (simplified)
-                price_higher_high = data['high'].iloc[-5:].max() > data['high'].iloc[-10:-5].max()
-                price_lower_low = data['low'].iloc[-5:].min() < data['low'].iloc[-10:-5].min()
+            # 2. Moderate Trend (ADX 25-40)
+            elif current_adx > 25:
+                if is_breakout:
+                    regime = MarketRegime.BREAKOUT
+                elif current_plus_di > current_minus_di:
+                    regime = MarketRegime.BULL_TREND
+                else:
+                    regime = MarketRegime.BEAR_TREND
                 
-                rsi_higher_high = data['rsi'].iloc[-5:].max() > data['rsi'].iloc[-10:-5].max()
-                rsi_lower_low = data['rsi'].iloc[-5:].min() < data['rsi'].iloc[-10:-5].min()
+            # 3. Weak Trend (ADX 20-25)
+            elif current_adx > 20:
+                if is_breakout:
+                    regime = MarketRegime.BREAKOUT
+                elif volatility_ratio > 1.3:
+                    regime = MarketRegime.HIGH_VOLATILITY
+                elif volatility_ratio < 0.7:
+                    regime = MarketRegime.LOW_VOLATILITY
+                else:
+                    regime = MarketRegime.RANGE_BOUND
                 
-                bullish_divergence = price_lower_low and not rsi_lower_low
-                bearish_divergence = price_higher_high and not rsi_higher_high
-                
-                potential_reversal = (bullish and overbought and bearish_divergence) or \
-                                    (not bullish and oversold and bullish_divergence)
+            # 4. No Trend (ADX < 20)
             else:
-                # Simplified reversal detection without RSI
-                potential_reversal = False
+                if volatility_ratio > 1.5:
+                    regime = MarketRegime.HIGH_VOLATILITY
+                elif volatility_ratio < 0.6:
+                    regime = MarketRegime.LOW_VOLATILITY
+                elif is_breakout:
+                    regime = MarketRegime.BREAKOUT
+                elif abs(data['close'].pct_change(5).iloc[-1]) > 0.02:  # 2% change in last 5 bars
+                    regime = MarketRegime.REVERSAL
+                else:
+                    regime = MarketRegime.SIDEWAYS
             
-            # Determine regime based on the metrics calculated
-            if potential_reversal:
-                return MarketRegime.REVERSAL
-            elif volatility_ratio > 1.5:
-                return MarketRegime.HIGH_VOLATILITY
-            elif volatility_ratio < 0.7:
-                return MarketRegime.LOW_VOLATILITY
-            elif trend_strength > 0.6:  # Strong trend
-                return MarketRegime.BULL_TREND if bullish else MarketRegime.BEAR_TREND
-            else:  # Weak trend
-                return MarketRegime.SIDEWAYS
-                
+            # Log the detected regime and key metrics
+            self.logger.info(f"Detected market regime: {regime.value} (ADX: {current_adx:.2f}, +DI: {current_plus_di:.2f}, -DI: {current_minus_di:.2f}, Volatility ratio: {volatility_ratio:.2f})")
+            return regime
+            
         except Exception as e:
             self.logger.error(f"Error detecting market regime: {str(e)}")
             return MarketRegime.SIDEWAYS
@@ -720,6 +761,151 @@ class AdvancedSignalProcessor:
             self.logger.error(f"Error calculating multi-timeframe score: {str(e)}")
             return result
 
+    def get_adaptive_indicator_parameters(self, data: pd.DataFrame, regime: MarketRegime = None) -> Dict[str, Dict[str, Any]]:
+        """
+        Get indicator parameters adapted to the current market regime
+        
+        Args:
+            data: DataFrame with price data
+            regime: Current market regime (if None, will be detected)
+            
+        Returns:
+            Dictionary of indicator parameters adjusted for the market regime
+        """
+        # Detect market regime if not provided
+        if regime is None:
+            regime = self.detect_market_regime(data)
+        
+        # Base parameters for different indicators
+        base_params = {
+            'ema': {
+                'fast_period': 9,
+                'slow_period': 21,
+                'signal_period': 9
+            },
+            'macd': {
+                'fast_period': 12,
+                'slow_period': 26,
+                'signal_period': 9
+            },
+            'rsi': {
+                'period': 14,
+                'overbought': 70,
+                'oversold': 30
+            },
+            'stochastic': {
+                'k_period': 14,
+                'd_period': 3,
+                'overbought': 80,
+                'oversold': 20
+            },
+            'bollinger': {
+                'period': 20,
+                'std_dev': 2.0
+            },
+            'atr': {
+                'period': 14,
+                'multiplier': 2.0
+            },
+            'adx': {
+                'period': 14,
+                'threshold': 25
+            },
+            'hull_ma': {
+                'period': 16
+            },
+            'ttm_squeeze': {
+                'bb_period': 20,
+                'bb_std_dev': 2.0,
+                'kc_period': 20,
+                'kc_multiplier': 1.5
+            }
+        }
+        
+        # Adjust parameters based on market regime
+        adjusted_params = base_params.copy()
+        
+        if regime == MarketRegime.BULL_TREND:
+            # In bull trend, use faster EMAs and less sensitive RSI
+            adjusted_params['ema']['fast_period'] = 8
+            adjusted_params['ema']['slow_period'] = 17
+            adjusted_params['macd']['fast_period'] = 8
+            adjusted_params['macd']['slow_period'] = 17
+            adjusted_params['rsi']['overbought'] = 75
+            adjusted_params['rsi']['oversold'] = 40
+            adjusted_params['bollinger']['std_dev'] = 2.2
+            adjusted_params['hull_ma']['period'] = 12
+            
+        elif regime == MarketRegime.BEAR_TREND:
+            # In bear trend, use faster EMAs and less sensitive RSI
+            adjusted_params['ema']['fast_period'] = 8
+            adjusted_params['ema']['slow_period'] = 17
+            adjusted_params['macd']['fast_period'] = 8
+            adjusted_params['macd']['slow_period'] = 17
+            adjusted_params['rsi']['overbought'] = 60
+            adjusted_params['rsi']['oversold'] = 25
+            adjusted_params['bollinger']['std_dev'] = 2.2
+            adjusted_params['hull_ma']['period'] = 12
+            
+        elif regime == MarketRegime.BREAKOUT:
+            # For breakouts, use faster indicators and wider Bollinger Bands
+            adjusted_params['ema']['fast_period'] = 5
+            adjusted_params['ema']['slow_period'] = 15
+            adjusted_params['macd']['fast_period'] = 8
+            adjusted_params['macd']['slow_period'] = 17
+            adjusted_params['rsi']['period'] = 10
+            adjusted_params['bollinger']['std_dev'] = 2.5
+            adjusted_params['atr']['multiplier'] = 2.5
+            adjusted_params['hull_ma']['period'] = 9
+            
+        elif regime == MarketRegime.HIGH_VOLATILITY:
+            # For high volatility, use slower indicators and wider bands
+            adjusted_params['ema']['fast_period'] = 12
+            adjusted_params['ema']['slow_period'] = 30
+            adjusted_params['macd']['fast_period'] = 16
+            adjusted_params['macd']['slow_period'] = 32
+            adjusted_params['rsi']['period'] = 21
+            adjusted_params['rsi']['overbought'] = 75
+            adjusted_params['rsi']['oversold'] = 25
+            adjusted_params['bollinger']['std_dev'] = 3.0
+            adjusted_params['atr']['multiplier'] = 3.0
+            adjusted_params['ttm_squeeze']['bb_std_dev'] = 2.5
+            adjusted_params['ttm_squeeze']['kc_multiplier'] = 2.0
+            
+        elif regime == MarketRegime.LOW_VOLATILITY:
+            # For low volatility, use faster indicators and tighter bands
+            adjusted_params['ema']['fast_period'] = 7
+            adjusted_params['ema']['slow_period'] = 14
+            adjusted_params['macd']['fast_period'] = 8
+            adjusted_params['macd']['slow_period'] = 17
+            adjusted_params['rsi']['period'] = 10
+            adjusted_params['rsi']['overbought'] = 65
+            adjusted_params['rsi']['oversold'] = 35
+            adjusted_params['bollinger']['std_dev'] = 1.5
+            adjusted_params['atr']['multiplier'] = 1.5
+            adjusted_params['ttm_squeeze']['bb_std_dev'] = 1.5
+            adjusted_params['ttm_squeeze']['kc_multiplier'] = 1.0
+            
+        elif regime == MarketRegime.SIDEWAYS or regime == MarketRegime.RANGE_BOUND:
+            # For range-bound markets, use standard params but more sensitive overbought/oversold
+            adjusted_params['rsi']['overbought'] = 65
+            adjusted_params['rsi']['oversold'] = 35
+            adjusted_params['stochastic']['overbought'] = 75
+            adjusted_params['stochastic']['oversold'] = 25
+            adjusted_params['bollinger']['std_dev'] = 1.8
+            
+        elif regime == MarketRegime.REVERSAL:
+            # For potential reversals, use medium-speed indicators
+            adjusted_params['ema']['fast_period'] = 7
+            adjusted_params['ema']['slow_period'] = 21
+            adjusted_params['macd']['fast_period'] = 10
+            adjusted_params['macd']['slow_period'] = 20
+            adjusted_params['rsi']['period'] = 12
+            adjusted_params['bollinger']['std_dev'] = 2.0
+            adjusted_params['hull_ma']['period'] = 12
+        
+        return adjusted_params
+
 # Create a utility function for easier usage
 def calculate_advanced_signal_score(data: pd.DataFrame) -> pd.Series:
     """
@@ -749,4 +935,511 @@ def calculate_multi_timeframe_signal_score(data_dict: Dict[str, pd.DataFrame],
         Dictionary with multi-timeframe signal scores
     """
     processor = AdvancedSignalProcessor()
-    return processor.calculate_multi_timeframe_score(data_dict, primary_tf) 
+    return processor.calculate_multi_timeframe_score(data_dict, primary_tf)
+
+class TrendAdaptiveStrategyMatrix:
+    """
+    A matrix of trend-adaptive trading strategies that adjust based on detected market conditions.
+    This provides optimal strategies, confirmation indicators, and position sizing for each market regime.
+    """
+    
+    def __init__(self, logger=None):
+        """Initialize the strategy matrix with default settings"""
+        self.logger = logger or logging.getLogger(__name__)
+        
+        # Define the base strategy matrix
+        self._strategy_matrix = {
+            # Strong Bull Trend strategies
+            MarketRegime.BULL_TREND: {
+                'primary_strategy': 'VWAP_PULLBACK',
+                'description': 'Buy on pullbacks to VWAP in strong uptrend',
+                'confirmation_indicators': [
+                    {'indicator': 'MACD_HISTOGRAM', 'condition': 'GREATER_THAN', 'value': 0},
+                    {'indicator': 'EMA_SLOPE', 'condition': 'POSITIVE', 'timeframe': '1h'}
+                ],
+                'position_sizing': 1.5,  # 150% of normal position size
+                'stop_loss_multiplier': 1.5,
+                'target_multiplier': 2.5,
+                'timeframes': ['1h', '15m', '5m']
+            },
+            
+            # Weak Bull Trend strategies
+            MarketRegime.RANGE_BOUND: {
+                'primary_strategy': 'EMA_CLOUD_BREAKOUT',
+                'description': 'Buy on breakouts above EMA cloud resistance',
+                'confirmation_indicators': [
+                    {'indicator': 'VOLUME', 'condition': 'GREATER_THAN', 'value': 'VOLUME_20_AVG'},
+                    {'indicator': 'RSI', 'condition': 'BETWEEN', 'value': [40, 60]}
+                ],
+                'position_sizing': 1.0,  # 100% of normal position size
+                'stop_loss_multiplier': 1.0,
+                'target_multiplier': 2.0,
+                'timeframes': ['15m', '5m']
+            },
+            
+            # Strong Bear Trend strategies
+            MarketRegime.BEAR_TREND: {
+                'primary_strategy': 'RALLY_SHORT',
+                'description': 'Short rallies in downtrends when price approaches resistance',
+                'confirmation_indicators': [
+                    {'indicator': 'RSI', 'condition': 'LESS_THAN', 'value': 60},
+                    {'indicator': 'VOLUME_DECLINING', 'condition': 'TRUE'}
+                ],
+                'position_sizing': 1.25,  # 125% of normal position size
+                'stop_loss_multiplier': 1.2,
+                'target_multiplier': 2.0,
+                'timeframes': ['1h', '15m']
+            },
+            
+            # Range-Bound Market strategies
+            MarketRegime.SIDEWAYS: {
+                'primary_strategy': 'OPTIONS_STRADDLE',
+                'description': 'Options straddle to profit from breakout in either direction',
+                'confirmation_indicators': [
+                    {'indicator': 'IV_PERCENTILE', 'condition': 'GREATER_THAN', 'value': 30},
+                    {'indicator': 'BB_WIDTH', 'condition': 'LESS_THAN', 'value': 'BB_WIDTH_20_AVG'}
+                ],
+                'position_sizing': 0.75,  # 75% of normal position size
+                'stop_loss_multiplier': 1.0,
+                'target_multiplier': 1.5,
+                'timeframes': ['1h', '15m']
+            },
+            
+            # High Volatility Market strategies
+            MarketRegime.HIGH_VOLATILITY: {
+                'primary_strategy': 'ATR_CHANNEL_BREAKOUT',
+                'description': 'Trade breakouts of ATR-based channels in volatile conditions',
+                'confirmation_indicators': [
+                    {'indicator': 'BB_WIDTH', 'condition': 'GREATER_THAN', 'value': 0.02},
+                    {'indicator': 'ADX', 'condition': 'GREATER_THAN', 'value': 25}
+                ],
+                'position_sizing': 0.5,  # 50% of normal position size
+                'stop_loss_multiplier': 2.0,
+                'target_multiplier': 3.0,
+                'timeframes': ['1h', '15m', '5m']
+            },
+            
+            # Breakout condition strategies
+            MarketRegime.BREAKOUT: {
+                'primary_strategy': 'MOMENTUM_BREAKOUT',
+                'description': 'Trade in the direction of strong breakouts from consolidation',
+                'confirmation_indicators': [
+                    {'indicator': 'VOLUME_SURGE', 'condition': 'GREATER_THAN', 'value': 2.0},
+                    {'indicator': 'ATR_EXPANSION', 'condition': 'GREATER_THAN', 'value': 1.5}
+                ],
+                'position_sizing': 1.0,  # 100% of normal position size
+                'stop_loss_multiplier': 1.5,
+                'target_multiplier': 2.5,
+                'timeframes': ['1h', '15m', '5m']
+            },
+            
+            # Low Volatility Market strategies
+            MarketRegime.LOW_VOLATILITY: {
+                'primary_strategy': 'MEAN_REVERSION',
+                'description': 'Mean reversion trades in low volatility environments',
+                'confirmation_indicators': [
+                    {'indicator': 'RSI_EXTREME', 'condition': 'TRUE'},
+                    {'indicator': 'BOLLINGER_BAND_BOUNCE', 'condition': 'TRUE'}
+                ],
+                'position_sizing': 0.75,  # 75% of normal position size
+                'stop_loss_multiplier': 0.8,
+                'target_multiplier': 1.5,
+                'timeframes': ['15m', '5m']
+            },
+            
+            # Reversal Market strategies
+            MarketRegime.REVERSAL: {
+                'primary_strategy': 'DIVERGENCE_REVERSAL',
+                'description': 'Trade reversals based on price-indicator divergences',
+                'confirmation_indicators': [
+                    {'indicator': 'RSI_DIVERGENCE', 'condition': 'TRUE'},
+                    {'indicator': 'VOLUME_CLIMAX', 'condition': 'TRUE'}
+                ],
+                'position_sizing': 0.6,  # 60% of normal position size
+                'stop_loss_multiplier': 1.2,
+                'target_multiplier': 2.0,
+                'timeframes': ['1h', '15m', '5m']
+            }
+        }
+        
+        # Trend confirmation protocol steps
+        self._confirmation_protocol = [
+            {'step': 'CHECK_1H_SMA_SLOPE', 'params': {'period': 200, 'lookback': 5}},
+            {'step': 'VERIFY_15M_MACD_CROSSOVER', 'params': {'direction': 'SAME_AS_TREND'}},
+            {'step': 'CONFIRM_5M_VOLUME_PRICE_ACTION', 'params': {'min_volume_ratio': 1.2}}
+        ]
+    
+    def get_strategy_for_regime(self, regime: MarketRegime) -> Dict[str, Any]:
+        """
+        Get the optimal strategy configuration for a specific market regime
+        
+        Args:
+            regime: Detected market regime
+            
+        Returns:
+            Dictionary with strategy configuration
+        """
+        # Use the detected regime or fall back to SIDEWAYS if not found
+        strategy = self._strategy_matrix.get(regime, self._strategy_matrix[MarketRegime.SIDEWAYS])
+        
+        self.logger.info(f"Selected strategy for {regime.value}: {strategy['primary_strategy']} - {strategy['description']}")
+        
+        return strategy
+    
+    def get_confirmation_protocol(self) -> List[Dict[str, Any]]:
+        """
+        Get the trend confirmation protocol steps
+        
+        Returns:
+            List of confirmation protocol steps
+        """
+        return self._confirmation_protocol.copy()
+    
+    def adjust_strategy_for_conditions(self, 
+                                     strategy: Dict[str, Any], 
+                                     conditions: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Adjust strategy parameters based on specific market conditions
+        
+        Args:
+            strategy: Base strategy dictionary
+            conditions: Dictionary with current market conditions
+            
+        Returns:
+            Adjusted strategy dictionary
+        """
+        adjusted_strategy = strategy.copy()
+        
+        # Adjust position sizing based on specific conditions
+        if 'volatility_percentile' in conditions:
+            vol_percentile = conditions['volatility_percentile']
+            
+            # Reduce position size in extremely high volatility
+            if vol_percentile > 90:
+                adjusted_strategy['position_sizing'] *= 0.6
+            # Increase position size in very low volatility for range-bound strategies
+            elif vol_percentile < 10 and strategy['primary_strategy'] in ['MEAN_REVERSION', 'OPTIONS_STRADDLE']:
+                adjusted_strategy['position_sizing'] *= 1.2
+        
+        # Adjust stop loss based on recent price action
+        if 'atr_percentile' in conditions:
+            atr_percentile = conditions['atr_percentile']
+            
+            # Widen stops in high ATR environments
+            if atr_percentile > 80:
+                adjusted_strategy['stop_loss_multiplier'] *= 1.3
+            # Tighten stops in low ATR environments
+            elif atr_percentile < 20:
+                adjusted_strategy['stop_loss_multiplier'] *= 0.8
+        
+        # Adjust for time of day if provided
+        if 'market_session' in conditions:
+            session = conditions['market_session']
+            
+            # Reduce position sizing in less favorable sessions
+            if session == 'midday':
+                adjusted_strategy['position_sizing'] *= 0.8
+            # Increase position sizing in more volatile sessions
+            elif session in ['open', 'close']:
+                adjusted_strategy['position_sizing'] *= 1.2
+        
+        return adjusted_strategy
+    
+    def execute_confirmation_protocol(self, 
+                                    data_dict: Dict[str, pd.DataFrame],
+                                    strategy: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Execute the trend confirmation protocol across multiple timeframes
+        
+        Args:
+            data_dict: Dictionary mapping timeframe names to DataFrames
+            strategy: Strategy configuration dictionary
+            
+        Returns:
+            Dictionary with confirmation results
+        """
+        results = {
+            'confirmed': False,
+            'confirmation_score': 0.0,
+            'steps_passed': 0,
+            'details': {}
+        }
+        
+        try:
+            # Check for required timeframes
+            required_timeframes = strategy['timeframes']
+            available_timeframes = list(data_dict.keys())
+            
+            missing_timeframes = [tf for tf in required_timeframes if tf not in available_timeframes]
+            if missing_timeframes:
+                self.logger.warning(f"Missing required timeframes for confirmation: {missing_timeframes}")
+                results['details']['missing_timeframes'] = missing_timeframes
+                return results
+            
+            # Extract the 1-hour, 15-min, and 5-min data if available
+            data_1h = data_dict.get('1h', None)
+            data_15m = data_dict.get('15m', None)
+            data_5m = data_dict.get('5m', None)
+            
+            steps_passed = 0
+            confirmation_score = 0.0
+            
+            # Step 1: Check 1-hour SMA slope (200-period)
+            if data_1h is not None and len(data_1h) >= 200:
+                # Calculate 200-period SMA
+                sma_200 = data_1h['close'].rolling(window=200).mean()
+                
+                # Calculate slope over last 5 periods
+                lookback = 5
+                slope = (sma_200.iloc[-1] - sma_200.iloc[-lookback]) / lookback
+                
+                # Normalize slope as percentage of price
+                norm_slope = slope / data_1h['close'].iloc[-1]
+                
+                # Check if slope aligns with strategy direction
+                if strategy['primary_strategy'] in ['VWAP_PULLBACK', 'EMA_CLOUD_BREAKOUT', 'MOMENTUM_BREAKOUT']:
+                    # Bullish strategies need positive slope
+                    if norm_slope > 0:
+                        steps_passed += 1
+                        confirmation_score += 0.4
+                        results['details']['1h_sma_slope'] = 'POSITIVE'
+                    else:
+                        results['details']['1h_sma_slope'] = 'NEGATIVE'
+                elif strategy['primary_strategy'] in ['RALLY_SHORT']:
+                    # Bearish strategies need negative slope
+                    if norm_slope < 0:
+                        steps_passed += 1
+                        confirmation_score += 0.4
+                        results['details']['1h_sma_slope'] = 'NEGATIVE'
+                    else:
+                        results['details']['1h_sma_slope'] = 'POSITIVE'
+                else:
+                    # Other strategies just need consistency with overall trend
+                    steps_passed += 1
+                    confirmation_score += 0.2
+                    results['details']['1h_sma_slope'] = 'SLOPE_CHECK_SKIPPED'
+            
+            # Step 2: Verify 15-min MACD crossover direction
+            if data_15m is not None and len(data_15m) >= 35:
+                # Calculate MACD components if not already in the data
+                if 'macd' not in data_15m.columns or 'macd_signal' not in data_15m.columns:
+                    ema12 = data_15m['close'].ewm(span=12, adjust=False).mean()
+                    ema26 = data_15m['close'].ewm(span=26, adjust=False).mean()
+                    macd = ema12 - ema26
+                    macd_signal = macd.ewm(span=9, adjust=False).mean()
+                    macd_hist = macd - macd_signal
+                else:
+                    macd = data_15m['macd']
+                    macd_signal = data_15m['macd_signal']
+                    macd_hist = data_15m.get('macd_hist', macd - macd_signal)
+                
+                # Check for recent crossover (within last 3 bars)
+                lookback = 3
+                
+                # Bullish crossover: MACD crosses above signal line
+                bullish_crossover = False
+                for i in range(1, min(lookback + 1, len(macd))):
+                    if macd.iloc[-i] > macd_signal.iloc[-i] and macd.iloc[-i-1] <= macd_signal.iloc[-i-1]:
+                        bullish_crossover = True
+                        break
+                
+                # Bearish crossover: MACD crosses below signal line
+                bearish_crossover = False
+                for i in range(1, min(lookback + 1, len(macd))):
+                    if macd.iloc[-i] < macd_signal.iloc[-i] and macd.iloc[-i-1] >= macd_signal.iloc[-i-1]:
+                        bearish_crossover = True
+                        break
+                
+                # Check if crossover aligns with strategy direction
+                if strategy['primary_strategy'] in ['VWAP_PULLBACK', 'EMA_CLOUD_BREAKOUT', 'MOMENTUM_BREAKOUT']:
+                    # Bullish strategies need bullish crossover
+                    if bullish_crossover:
+                        steps_passed += 1
+                        confirmation_score += 0.3
+                        results['details']['15m_macd_crossover'] = 'BULLISH'
+                    else:
+                        results['details']['15m_macd_crossover'] = 'NO_BULLISH_CROSSOVER'
+                elif strategy['primary_strategy'] in ['RALLY_SHORT']:
+                    # Bearish strategies need bearish crossover
+                    if bearish_crossover:
+                        steps_passed += 1
+                        confirmation_score += 0.3
+                        results['details']['15m_macd_crossover'] = 'BEARISH'
+                    else:
+                        results['details']['15m_macd_crossover'] = 'NO_BEARISH_CROSSOVER'
+                else:
+                    # For other strategies, any recent crossover is good
+                    if bullish_crossover or bearish_crossover:
+                        steps_passed += 1
+                        confirmation_score += 0.2
+                        results['details']['15m_macd_crossover'] = 'CROSSOVER_DETECTED'
+                    else:
+                        results['details']['15m_macd_crossover'] = 'NO_CROSSOVER'
+            
+            # Step 3: Confirm with 5-min volume-weighted price action
+            if data_5m is not None and len(data_5m) >= 20:
+                # Calculate volume metrics
+                avg_volume = data_5m['volume'].rolling(window=20).mean()
+                recent_vol_ratio = data_5m['volume'].iloc[-1] / avg_volume.iloc[-1] if avg_volume.iloc[-1] > 0 else 1.0
+                
+                # Calculate price action
+                is_bullish_bar = data_5m['close'].iloc[-1] > data_5m['open'].iloc[-1]
+                is_bearish_bar = data_5m['close'].iloc[-1] < data_5m['open'].iloc[-1]
+                
+                # Check if volume-price action aligns with strategy direction
+                volume_confirmed = recent_vol_ratio >= 1.2
+                
+                if strategy['primary_strategy'] in ['VWAP_PULLBACK', 'EMA_CLOUD_BREAKOUT', 'MOMENTUM_BREAKOUT']:
+                    # Bullish strategies need bullish price action with volume
+                    if is_bullish_bar and volume_confirmed:
+                        steps_passed += 1
+                        confirmation_score += 0.3
+                        results['details']['5m_volume_price'] = 'BULLISH_VOLUME_CONFIRMED'
+                    elif is_bullish_bar:
+                        steps_passed += 1
+                        confirmation_score += 0.1
+                        results['details']['5m_volume_price'] = 'BULLISH_LOW_VOLUME'
+                    else:
+                        results['details']['5m_volume_price'] = 'NOT_BULLISH'
+                        
+                elif strategy['primary_strategy'] in ['RALLY_SHORT']:
+                    # Bearish strategies need bearish price action with volume
+                    if is_bearish_bar and volume_confirmed:
+                        steps_passed += 1
+                        confirmation_score += 0.3
+                        results['details']['5m_volume_price'] = 'BEARISH_VOLUME_CONFIRMED'
+                    elif is_bearish_bar:
+                        steps_passed += 1
+                        confirmation_score += 0.1
+                        results['details']['5m_volume_price'] = 'BEARISH_LOW_VOLUME'
+                    else:
+                        results['details']['5m_volume_price'] = 'NOT_BEARISH'
+                else:
+                    # For other strategies, just check for above-average volume
+                    if volume_confirmed:
+                        steps_passed += 1
+                        confirmation_score += 0.2
+                        results['details']['5m_volume_price'] = 'VOLUME_CONFIRMED'
+                    else:
+                        results['details']['5m_volume_price'] = 'LOW_VOLUME'
+            
+            # Final confirmation results
+            results['steps_passed'] = steps_passed
+            results['confirmation_score'] = confirmation_score
+            
+            # Confirm if we passed at least 2 out of 3 steps and score is high enough
+            results['confirmed'] = steps_passed >= 2 and confirmation_score >= 0.5
+            
+            return results
+        
+        except Exception as e:
+            self.logger.error(f"Error in trend confirmation protocol: {str(e)}")
+            results['details']['error'] = str(e)
+            return results
+
+    def get_strategy_recommendations(self, 
+                                   data_dict: Dict[str, pd.DataFrame], 
+                                   regime: MarketRegime = None,
+                                   conditions: Dict[str, Any] = None) -> Dict[str, Any]:
+        """
+        Get comprehensive strategy recommendations based on market conditions
+        
+        Args:
+            data_dict: Dictionary mapping timeframe names to DataFrames
+            regime: Detected market regime (if None, will be detected)
+            conditions: Additional market conditions
+            
+        Returns:
+            Dictionary with strategy recommendations
+        """
+        try:
+            # Use provided conditions or initialize empty dict
+            market_conditions = conditions or {}
+            
+            # Detect market regime if not provided
+            if regime is None:
+                processor = AdvancedSignalProcessor()
+                # Use primary timeframe data for regime detection
+                primary_tf = min(data_dict.keys()) if data_dict else None
+                if primary_tf and primary_tf in data_dict:
+                    regime = processor.detect_market_regime(data_dict[primary_tf])
+                else:
+                    # Default to sideways if we can't detect
+                    regime = MarketRegime.SIDEWAYS
+            
+            # Get base strategy for the detected regime
+            base_strategy = self.get_strategy_for_regime(regime)
+            
+            # Adjust strategy based on current market conditions
+            adjusted_strategy = self.adjust_strategy_for_conditions(base_strategy, market_conditions)
+            
+            # Execute trend confirmation protocol
+            confirmation_results = self.execute_confirmation_protocol(data_dict, adjusted_strategy)
+            
+            # Compile final recommendations
+            recommendations = {
+                'market_regime': regime,
+                'primary_strategy': adjusted_strategy['primary_strategy'],
+                'description': adjusted_strategy['description'],
+                'position_sizing': adjusted_strategy['position_sizing'],
+                'stop_loss_multiplier': adjusted_strategy['stop_loss_multiplier'],
+                'target_multiplier': adjusted_strategy['target_multiplier'],
+                'confirmation': confirmation_results,
+                'ready_to_trade': confirmation_results['confirmed'],
+                'timeframes': adjusted_strategy['timeframes'],
+                'key_indicators': adjusted_strategy['confirmation_indicators']
+            }
+            
+            # Add strategy-specific trading rules
+            if adjusted_strategy['primary_strategy'] == 'VWAP_PULLBACK':
+                recommendations['entry_rules'] = [
+                    "Wait for price to pull back to VWAP",
+                    "Confirm bullish reversal candle at VWAP",
+                    "Enter on close of confirmation candle",
+                    "Place stop loss below the low of reversal candle"
+                ]
+            elif adjusted_strategy['primary_strategy'] == 'EMA_CLOUD_BREAKOUT':
+                recommendations['entry_rules'] = [
+                    "Wait for price to break above EMA cloud resistance",
+                    "Confirm breakout with volume increase",
+                    "Enter on close above resistance",
+                    "Place stop loss below the EMA cloud"
+                ]
+            elif adjusted_strategy['primary_strategy'] == 'RALLY_SHORT':
+                recommendations['entry_rules'] = [
+                    "Wait for price to rally to resistance area",
+                    "Confirm bearish reversal pattern",
+                    "Enter on break of low of reversal candle",
+                    "Place stop loss above the high of reversal pattern"
+                ]
+            else:
+                recommendations['entry_rules'] = [
+                    "Follow confirmation indicators for entry signals",
+                    "Size position according to recommended position sizing",
+                    "Use the appropriate stop loss multiplier for risk management"
+                ]
+            
+            return recommendations
+            
+        except Exception as e:
+            self.logger.error(f"Error getting strategy recommendations: {str(e)}")
+            return {
+                'market_regime': regime or MarketRegime.SIDEWAYS,
+                'primary_strategy': 'ERROR',
+                'error': str(e),
+                'ready_to_trade': False
+            }
+
+# Utility function for easier usage
+def get_trend_adaptive_strategy(data_dict: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
+    """
+    Simplified interface for getting trend-adaptive strategy recommendations
+    
+    Args:
+        data_dict: Dictionary mapping timeframe names to DataFrames
+        
+    Returns:
+        Dictionary with strategy recommendations
+    """
+    matrix = TrendAdaptiveStrategyMatrix()
+    return matrix.get_strategy_recommendations(data_dict) 
