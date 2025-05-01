@@ -229,11 +229,11 @@ def render_backtest_ui(data, symbol=None):
                             display_trades['exit_date'] = display_trades['exit_date'].dt.strftime('%Y-%m-%d %H:%M')
                         
                         # Format numeric columns
-                        display_trades['entry_price'] = display_trades['entry_price'].map('${:,.2f}'.format)
-                        display_trades['exit_price'] = display_trades['exit_price'].map('${:,.2f}'.format)
-                        display_trades['shares'] = display_trades['shares'].map('{:,.2f}'.format)
-                        display_trades['pnl'] = display_trades['pnl'].map('${:,.2f}'.format)
-                        display_trades['pnl_pct'] = display_trades['pnl_pct'].map('{:,.2f}%'.format)
+                        display_trades['entry_price'] = display_trades['entry_price'].apply(lambda x: f'${x:,.2f}' if x is not None else 'N/A')
+                        display_trades['exit_price'] = display_trades['exit_price'].apply(lambda x: f'${x:,.2f}' if x is not None else 'N/A')
+                        display_trades['shares'] = display_trades['shares'].apply(lambda x: f'{x:,.2f}' if x is not None else 'N/A')
+                        display_trades['pnl'] = display_trades['pnl'].apply(lambda x: f'${x:,.2f}' if x is not None else 'N/A')
+                        display_trades['pnl_pct'] = display_trades['pnl_pct'].apply(lambda x: f'{x:,.2f}%' if x is not None else 'N/A')
                         
                         # Add trade number
                         display_trades.insert(0, 'Trade #', range(1, len(display_trades) + 1))

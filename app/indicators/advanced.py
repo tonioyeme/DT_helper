@@ -233,7 +233,7 @@ def add_advanced_indicators(data: pd.DataFrame) -> pd.DataFrame:
         DataFrame with added indicators
     """
     if data is None or len(data) < 50:
-        return data
+        return None, None, None
     
     result = data.copy()
     

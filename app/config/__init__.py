@@ -6,7 +6,9 @@ Contains settings, parameters, and configurations for different instruments and 
 # Import all configuration objects
 try:
     from app.config.instruments.spy import SPY_CONFIG
+    print("Successfully loaded SPY configuration.")
 except ImportError:
+    print("SPY configuration not found. Using default settings.")
     # Define a default SPY config if the file doesn't exist
     SPY_CONFIG = {
         'indicators': {
@@ -26,7 +28,11 @@ except ImportError:
         }
     }
 
-from .defaults import DEFAULT_CONFIG
+try:
+    from .defaults import DEFAULT_CONFIG
+except ImportError:
+    print("Default configuration not found. Using basic defaults.")
+    DEFAULT_CONFIG = {}
 
 # Export config objects
 __all__ = [

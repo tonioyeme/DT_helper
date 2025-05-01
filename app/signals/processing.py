@@ -649,11 +649,15 @@ class AdvancedSignalProcessor:
             confidence = 0.7 + (volatility_scores * 0.3)  # Base confidence + volatility adjustment
             
             # Reduce confidence for mixed signals
-            signal_agreement = (
-                (trend_scores > 0.5) & 
-                (momentum_scores > 0.5) & 
-                (volume_scores > 0.5)
-            ).astype(float)
+            signal_agreement = pd.Series(False, index=trend_scores.index)
+            
+            # Safely check each component and create a mask for agreement
+            valid_indices = ~trend_scores.isna() & ~momentum_scores.isna() & ~volume_scores.isna()
+            agreement_indices = valid_indices & (trend_scores > 0.5) & (momentum_scores > 0.5) & (volume_scores > 0.5)
+            signal_agreement.loc[agreement_indices] = True
+            
+            # Convert to float for arithmetic operations
+            signal_agreement = signal_agreement.astype(float)
             
             # Final confidence score
             confidence = confidence * (0.7 + 0.3 * signal_agreement)
@@ -680,7 +684,7 @@ class AdvancedSignalProcessor:
         """
         result = {}
         
-        if not data_dict:
+        if not isinstance(data_dict, dict) or len(data_dict) == 0:
             return result
             
         try:
@@ -700,9 +704,9 @@ class AdvancedSignalProcessor:
             if primary_tf is None or primary_tf not in data_dict:
                 # Default to shortest available timeframe
                 timeframes = list(data_dict.keys())
-                primary_tf = timeframes[0] if timeframes else None
+                primary_tf = timeframes[0] if len(timeframes) > 0 else None
             
-            if not primary_tf:
+            if primary_tf is None:
                 return result
                 
             # Calculate signal scores for each timeframe
@@ -712,7 +716,7 @@ class AdvancedSignalProcessor:
             
             # Get primary timeframe scores
             primary_scores = tf_scores.get(primary_tf, {})
-            if not primary_scores:
+            if len(primary_scores) == 0:
                 return result
                 
             # Copy primary timeframe results as base
@@ -731,7 +735,7 @@ class AdvancedSignalProcessor:
                     weights.append(weight)
             
             # Calculate weighted average if we have scores
-            if signal_scores and weights:
+            if len(signal_scores) > 0 and len(weights) > 0:
                 weighted_sum = sum(s * w for s, w in zip(signal_scores, weights))
                 weight_sum = sum(weights)
                 consensus_score = weighted_sum / weight_sum if weight_sum > 0 else 0
@@ -741,7 +745,7 @@ class AdvancedSignalProcessor:
                 # Determine if there's alignment across timeframes
                 alignment_threshold = 0.15  # Maximum deviation for "aligned" signals
                 deviations = [abs(s - consensus_score) for s in signal_scores]
-                max_deviation = max(deviations) if deviations else 0
+                max_deviation = max(deviations) if len(deviations) > 0 else 0
                 
                 result['aligned'] = max_deviation <= alignment_threshold
                 result['max_deviation'] = max_deviation
@@ -1360,7 +1364,7 @@ class TrendAdaptiveStrategyMatrix:
             if regime is None:
                 processor = AdvancedSignalProcessor()
                 # Use primary timeframe data for regime detection
-                primary_tf = min(data_dict.keys()) if data_dict else None
+                primary_tf = min(data_dict.keys()) if data_dict is not None and isinstance(data_dict, dict) and len(data_dict) > 0 else None
                 if primary_tf and primary_tf in data_dict:
                     regime = processor.detect_market_regime(data_dict[primary_tf])
                 else:

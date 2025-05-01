@@ -24,7 +24,7 @@ def generate_tradingview_chart_url(symbol, exchange="NASDAQ", timeframe="D", ind
     }
     
     # Add indicators to URL if specified
-    if indicators:
+    if indicators is not None and isinstance(indicators, list) and len(indicators) > 0:
         # Map indicator names to TradingView study codes
         indicator_map = {
             "ema": "MAExp",
@@ -41,7 +41,7 @@ def generate_tradingview_chart_url(symbol, exchange="NASDAQ", timeframe="D", ind
             if indicator in indicator_map:
                 studies.append(indicator_map[indicator])
         
-        if studies:
+        if len(studies) > 0:
             params["studies"] = ",".join(studies)
     
     # Construct the URL
@@ -69,7 +69,7 @@ study("Day Trading Helper", overlay=true)
 """
     
     # Add indicator calculations
-    if "ema" in indicators or "ema_cloud" in indicators:
+    if indicators is not None and isinstance(indicators, list) and "ema" in indicators or "ema_cloud" in indicators:
         script += """
 // EMA calculations
 fast_length = input(20, title="Fast EMA Length")
@@ -91,7 +91,7 @@ fill(fast_ema, slow_ema, color=ema_cloud_bullish ? color.new(color.green, 90) : 
 
 """
     
-    if "macd" in indicators:
+    if indicators is not None and isinstance(indicators, list) and "macd" in indicators:
         script += """
 // MACD calculation
 fast_ma = input(12, title="MACD Fast Length")
@@ -104,7 +104,7 @@ signal_length = input(9, title="MACD Signal Length")
 
 """
     
-    if "vwap" in indicators:
+    if indicators is not None and isinstance(indicators, list) and "vwap" in indicators:
         script += """
 // VWAP calculation
 show_vwap = input(true, title="Show VWAP")
@@ -114,7 +114,7 @@ plot(show_vwap ? vwap_value : na, title="VWAP", color=color.blue, linewidth=2)
 """
     
     # Add signal generation if requested
-    if signals:
+    if signals is True:
         script += """
 // Signal generation
 price_above_fast_ema = close > fast_ema
@@ -181,7 +181,7 @@ def render_tradingview_widget(symbol, exchange, timeframe, indicators=None):
     st.markdown(f"[Open in TradingView]({chart_url})")
     
     # Generate Pine Script
-    if indicators:
+    if indicators is not None and isinstance(indicators, list) and len(indicators) > 0:
         with st.expander("Pine Script for Indicators"):
             pine_script = generate_indicator_script(indicators)
             st.code(pine_script, language="pine")

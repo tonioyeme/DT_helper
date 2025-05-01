@@ -20,7 +20,9 @@ from app.indicators import (
 
 try:
     from app.config.instruments.spy import SPY_CONFIG
+    print("Successfully loaded SPY configuration in spy_strategy.py")
 except ImportError:
+    print("SPY configuration import failed in spy_strategy.py. Using built-in defaults.")
     # Default configuration if the SPY_CONFIG is not available
     SPY_CONFIG = {
         'indicators': {
@@ -196,29 +198,33 @@ def analyze_spy_day_trading(data: pd.DataFrame) -> Dict[str, Any]:
                 if any(market_open_mask):
                     # Find first candle after market open
                     market_open_idx = df.index[market_open_mask][0]
-                    opening_range_end_idx = df.index[df.index > market_open_idx + pd.Timedelta(minutes=orb_minutes)]
-                    
-                    if len(opening_range_end_idx) > 0:
-                        opening_range_end = opening_range_end_idx[0]
-                        opening_range = df[(df.index >= market_open_idx) & (df.index < opening_range_end)]
+                    # Use Timedelta properly for timestamp arithmetic
+                    if len(df.index[df.index > market_open_idx]) > 0:
+                        # Find indexes after market open + opening range minutes
+                        opening_range_end_time = market_open_idx + pd.Timedelta(minutes=orb_minutes)
+                        opening_range_end_idx = df.index[df.index > opening_range_end_time]
                         
-                        if not opening_range.empty:
-                            or_high = opening_range['high'].max()
-                            or_low = opening_range['low'].min()
+                        if len(opening_range_end_idx) > 0:
+                            opening_range_end = opening_range_end_idx[0]
+                            opening_range = df[(df.index >= market_open_idx) & (df.index < opening_range_end)]
                             
-                            # After opening range, check for breakouts
-                            for idx in df.index[df.index >= opening_range_end]:
-                                # ORB Upside breakout
-                                if df.loc[idx, 'high'] > or_high:
-                                    signals.loc[idx, 'buy_score'] += strategy_config['orb'].get('weight', 1.8)
-                                    if idx > 0 and signals.loc[idx, 'buy_score'] > signal_config.get('threshold', 0.6):
-                                        signals.loc[idx, 'buy_signal'] = True
+                            if not opening_range.empty:
+                                or_high = opening_range['high'].max()
+                                or_low = opening_range['low'].min()
                                 
-                                # ORB Downside breakout
-                                if df.loc[idx, 'low'] < or_low:
-                                    signals.loc[idx, 'sell_score'] += strategy_config['orb'].get('weight', 1.8)
-                                    if idx > 0 and signals.loc[idx, 'sell_score'] > signal_config.get('threshold', 0.6):
-                                        signals.loc[idx, 'sell_signal'] = True
+                                # After opening range, check for breakouts
+                                for idx in df.index[df.index >= opening_range_end]:
+                                    # ORB Upside breakout
+                                    if df.loc[idx, 'high'] > or_high:
+                                        signals.loc[idx, 'buy_score'] += strategy_config['orb'].get('weight', 1.8)
+                                        if idx > 0 and signals.loc[idx, 'buy_score'] > signal_config.get('threshold', 0.6):
+                                            signals.loc[idx, 'buy_signal'] = True
+                                    
+                                    # ORB Downside breakout
+                                    if df.loc[idx, 'low'] < or_low:
+                                        signals.loc[idx, 'sell_score'] += strategy_config['orb'].get('weight', 1.8)
+                                        if idx > 0 and signals.loc[idx, 'sell_score'] > signal_config.get('threshold', 0.6):
+                                            signals.loc[idx, 'sell_signal'] = True
         
         # Strategy 2: VWAP Bollinger Band Strategy
         if strategy_config.get('vwap_bollinger', {}).get('enabled', True):
@@ -422,34 +428,54 @@ def render_spy_signals(results: Dict[str, Any], symbol: str = "SPY"):
             # Format timestamp in Eastern Time
             if hasattr(idx, 'tz_convert'):
                 eastern_tz = pytz.timezone('US/Eastern')
+                # Convert to Eastern time and format correctly
                 timestamp = idx.tz_convert(eastern_tz).strftime("%Y-%m-%d %H:%M:%S")
             else:
                 timestamp = str(idx)
             
+            # Double-check timestamp is not in the future
+            if isinstance(idx, pd.Timestamp):
+                now = pd.Timestamp.now(tz='UTC')
+                if idx > now:
+                    # If timestamp is in the future, use current date with the time from the index
+                    current_date = datetime.now().strftime("%Y-%m-%d")
+                    if hasattr(idx, 'tz_convert'):
+                        time_part = idx.tz_convert(eastern_tz).strftime("%H:%M:%S")
+                    else:
+                        time_part = idx.strftime("%H:%M:%S")
+                    timestamp = f"{current_date} {time_part}"
+            
             # Determine signal type
             signal_type = "BUY" if row.get('buy_signal', False) else "SELL" if row.get('sell_signal', False) else "NEUTRAL"
             
-            # Calculate risk-reward ratio
+            # Get values safely with None checks
+            signal_price = row.get('signal_price')
+            target_price = row.get('target_price')
+            stop_loss = row.get('stop_loss')
+            
+            # Calculate risk-reward ratio with thorough None/zero checks
             risk_reward = None
-            if signal_type == "BUY" and row.get('signal_price', 0) > 0 and row.get('target_price', 0) > 0 and row.get('stop_loss', 0) > 0:
-                risk = row['signal_price'] - row['stop_loss']
-                reward = row['target_price'] - row['signal_price']
-                if risk > 0:
-                    risk_reward = reward / risk
-            elif signal_type == "SELL" and row.get('signal_price', 0) > 0 and row.get('target_price', 0) > 0 and row.get('stop_loss', 0) > 0:
-                risk = row['stop_loss'] - row['signal_price']
-                reward = row['signal_price'] - row['target_price']
-                if risk > 0:
-                    risk_reward = reward / risk
+            if signal_type == "BUY" and signal_price is not None and target_price is not None and stop_loss is not None:
+                if signal_price > 0 and target_price > 0 and stop_loss > 0:
+                    risk = signal_price - stop_loss
+                    reward = target_price - signal_price
+                    if risk > 0:
+                        risk_reward = reward / risk
+            elif signal_type == "SELL" and signal_price is not None and target_price is not None and stop_loss is not None:
+                if signal_price > 0 and target_price > 0 and stop_loss > 0:
+                    risk = stop_loss - signal_price
+                    reward = signal_price - target_price
+                    if risk > 0:
+                        risk_reward = reward / risk
             
             formatted_signal = {
                 "timestamp": timestamp,
                 "type": signal_type,
-                "price": row.get('signal_price', 0),
+                "price": signal_price if signal_price is not None else 0,
                 "strength": row.get('signal_strength', 0),
                 "score": row.get('buy_score' if signal_type == "BUY" else 'sell_score', 0),
-                "target": row.get('target_price', None),
-                "stop_loss": row.get('stop_loss', None),
+                "target": target_price,
+                "stop_loss": stop_loss,
                 "risk_reward": risk_reward
             }
             

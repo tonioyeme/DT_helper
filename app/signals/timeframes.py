@@ -335,14 +335,22 @@ class TimeFrameManager:
             confirms = False
             conflicts = False
             
-            if primary_signals.get("buy_signal", False) and tf_signals.get("buy_signal", False):
+            # Get boolean values safely
+            primary_buy = bool(primary_signals.get("buy_signal", False))
+            primary_sell = bool(primary_signals.get("sell_signal", False))
+            primary_neutral = bool(primary_signals.get("neutral_signal", False))
+            
+            tf_buy = bool(tf_signals.get("buy_signal", False))
+            tf_sell = bool(tf_signals.get("sell_signal", False))
+            tf_neutral = bool(tf_signals.get("neutral_signal", False))
+            
+            if primary_buy and tf_buy:
                 confirms = True
-            elif primary_signals.get("sell_signal", False) and tf_signals.get("sell_signal", False):
+            elif primary_sell and tf_sell:
                 confirms = True
-            elif primary_signals.get("neutral_signal", False) and tf_signals.get("neutral_signal", False):
+            elif primary_neutral and tf_neutral:
                 confirms = True
-            elif (primary_signals.get("buy_signal", False) and tf_signals.get("sell_signal", False)) or \
-                 (primary_signals.get("sell_signal", False) and tf_signals.get("buy_signal", False)):
+            elif (primary_buy and tf_sell) or (primary_sell and tf_buy):
                 conflicts = True
                 
             # Add to confirmation or conflict lists
@@ -550,16 +558,21 @@ class TimeFrameManager:
                 tf1_signals = tf1_data["signals"]
                 tf2_signals = tf2_data["signals"]
                 
-                # Simple agreement check
-                agreement = 0.0
+                # Check signal agreement
+                # Get the boolean values safely using bool() for any ambiguous values
+                tf1_buy = bool(tf1_signals.get("buy_signal", False))
+                tf1_sell = bool(tf1_signals.get("sell_signal", False))
+                tf1_neutral = bool(tf1_signals.get("neutral_signal", False))
+                
+                tf2_buy = bool(tf2_signals.get("buy_signal", False))
+                tf2_sell = bool(tf2_signals.get("sell_signal", False))
+                tf2_neutral = bool(tf2_signals.get("neutral_signal", False))
                 
                 # Check signal agreement
-                if (tf1_signals.get("buy_signal", False) and tf2_signals.get("buy_signal", False)) or \
-                   (tf1_signals.get("sell_signal", False) and tf2_signals.get("sell_signal", False)) or \
-                   (tf1_signals.get("neutral_signal", False) and tf2_signals.get("neutral_signal", False)):
+                if (tf1_buy and tf2_buy) or (tf1_sell and tf2_sell) or (tf1_neutral and tf2_neutral):
                     agreement = 1.0
                 # Check partial agreement (one neutral, one directional)
-                elif (tf1_signals.get("neutral_signal", False) or tf2_signals.get("neutral_signal", False)):
+                elif (tf1_neutral or tf2_neutral):
                     agreement = 0.5
                 # Complete disagreement
                 else:
@@ -833,8 +846,12 @@ class MultiTimeFrameAnalyzer:
         for tf_name, tf_data in aligned_signals.items():
             total_weight += tf_data['weight']
             
+            # Safely get boolean values
+            is_buy_signal = bool(tf_data['signals'].get('buy_signal', False))
+            is_sell_signal = bool(tf_data['signals'].get('sell_signal', False))
+            
             # Add to buy score if this timeframe has a buy signal
-            if tf_data['signals'].get('buy_signal', False):
+            if is_buy_signal:
                 buy_factor = 1.0
                 # Consider confirmation level if available
                 if 'confirmation_level' in tf_data['signals']:
@@ -842,7 +859,7 @@ class MultiTimeFrameAnalyzer:
                 buy_score += tf_data['weight'] * buy_factor
                 
             # Add to sell score if this timeframe has a sell signal
-            if tf_data['signals'].get('sell_signal', False):
+            if is_sell_signal:
                 sell_factor = 1.0
                 # Consider confirmation level if available
                 if 'confirmation_level' in tf_data['signals']:
@@ -924,8 +941,11 @@ class MultiTimeFrameAnalyzer:
             
             for tf_name, tf_data in aligned_signals.items():
                 # Simple heuristic: shorter timeframe names are usually more granular
-                if ((alignment_result['dominant_signal'] == "buy" and tf_data['signals'].get('buy_signal', False)) or
-                    (alignment_result['dominant_signal'] == "sell" and tf_data['signals'].get('sell_signal', False))):
+                is_buy_signal = bool(tf_data['signals'].get('buy_signal', False))
+                is_sell_signal = bool(tf_data['signals'].get('sell_signal', False))
+                
+                if ((alignment_result['dominant_signal'] == "buy" and is_buy_signal) or
+                    (alignment_result['dominant_signal'] == "sell" and is_sell_signal)):
                     
                     # Convert common timeframe notation to minutes for comparison
                     granularity = float('inf')

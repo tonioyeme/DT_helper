@@ -224,8 +224,8 @@ def render_trends(data, symbol=None):
                 if 'date' in crossovers_df.columns:
                     if hasattr(crossovers_df['date'].iloc[0], 'strftime'):
                         crossovers_df['date'] = crossovers_df['date'].dt.strftime('%Y-%m-%d %H:%M')
-                if 'price' in crossovers_df.columns:
-                    crossovers_df['price'] = crossovers_df['price'].map('${:,.2f}'.format)
+                if not crossovers_df.empty and 'price' in crossovers_df.columns:
+                    crossovers_df['price'] = crossovers_df['price'].apply(lambda x: f'${x:,.2f}' if x is not None else 'N/A')
                 
                 st.dataframe(crossovers_df.sort_values('date', ascending=False), use_container_width=True)
         else:

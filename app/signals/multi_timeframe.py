@@ -187,13 +187,12 @@ class MultiTimeframeFramework:
         momentum_confirmation = signal_analysis.get('momentum', 0) > entry_analysis.get('momentum', 0)
         
         # Volume confirmation across timeframes
-        volume_confirmed = (
-            self.timeframes[self.trend_tf]['data']['volume'].iloc[-1] > 
-            self.timeframes[self.trend_tf]['data']['volume'].rolling(20).mean().iloc[-1]
-        ) and (
-            self.timeframes[self.signal_tf]['data']['volume'].iloc[-1] > 
-            self.timeframes[self.signal_tf]['data']['volume'].rolling(20).mean().iloc[-1]
-        )
+        trend_volume = self.timeframes[self.trend_tf]['data']['volume'].iloc[-1]
+        trend_volume_mean = self.timeframes[self.trend_tf]['data']['volume'].rolling(20).mean().iloc[-1]
+        signal_volume = self.timeframes[self.signal_tf]['data']['volume'].iloc[-1]
+        signal_volume_mean = self.timeframes[self.signal_tf]['data']['volume'].rolling(20).mean().iloc[-1]
+        
+        volume_confirmed = (trend_volume > trend_volume_mean) and (signal_volume > signal_volume_mean)
         
         # Calculate overall confirmation
         confirmed = trend_aligned and momentum_confirmation

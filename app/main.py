@@ -1,6 +1,39 @@
+import os
+import pandas as pd
+import numpy as np
+import yfinance as yf
 import streamlit as st
+import ccxt
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from datetime import datetime, timedelta, time
+import pytz
+import warnings
+import traceback
+from pathlib import Path
 
-# Set page configuration - this must be the first Streamlit command
+# Import helper modules
+from app.signals.generator import (
+    generate_signals,
+    generate_signals_advanced,
+    analyze_single_day,
+    generate_signals_multi_timeframe,
+    is_market_hours
+)
+from app.components.signals import (
+    render_signal_table,
+    render_signals,
+    render_orb_signals,
+    render_advanced_signals
+)
+from app.data.loader import (
+    load_sample_data
+)
+
+# Suppress warnings
+warnings.filterwarnings('ignore')
+
+# Set page config
 st.set_page_config(
     page_title="Day Trading Helper",
     page_icon="📈",
@@ -8,47 +41,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta
-import json
-from io import StringIO
-import os
-import ccxt
-from alpaca.data import StockHistoricalDataClient, TimeFrame as AlpacaTimeFrame, StockBarsRequest
-from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import GetAssetsRequest
-from alpaca.trading.enums import AssetClass, AssetStatus
-import pytz
-from dotenv import load_dotenv
-
-from app.components import (
-    render_dashboard,
-    render_signal_table,
-    render_risk_analysis,
-    render_risk_calculator,
-    render_patterns_section,
-    render_backtest,
-    render_signals,
-    render_signal_chart,
-    render_advanced_signals,
-    render_orb_signals
-)
-from app.tradingview import (
-    generate_tradingview_chart_url,
-    generate_indicator_script
-)
-from app.signals import generate_signals
-from app.data.loader import (
-    load_alpaca_data,
-    load_tradingview_data,
-    load_sample_data
-)
-
 # Load environment variables for API keys
-load_dotenv()
-
-# Initialize session state for cached data
 if 'data' not in st.session_state:
     st.session_state.data = None
 if 'signals' not in st.session_state:
@@ -59,342 +52,122 @@ if 'exchange' not in st.session_state:
     st.session_state.exchange = 'NASDAQ'
 
 def configure_api_keys():
-    """Configure Alpaca API keys"""
-    st.title("API Key Configuration")
-    st.markdown("You need to set up your Alpaca API keys to access market data.")
+    """Configure API keys for various data providers"""
+    st.title("Day Trading Helper")
+    st.header("API Key Configuration")
     
-    api_key = os.getenv("ALPACA_API_KEY", "")
-    api_secret = os.getenv("ALPACA_API_SECRET", "")
+    st.write("""
+    ### No API Keys Required
     
-    with st.form("api_key_form"):
-        new_api_key = st.text_input("Alpaca API Key", value=api_key, type="password")
-        new_api_secret = st.text_input("Alpaca API Secret", value=api_secret, type="password")
-        submit = st.form_submit_button("Save Keys")
-        
-        if submit:
-            if new_api_key and new_api_secret:
-                # Save keys to environment variables for current session
-                os.environ["ALPACA_API_KEY"] = new_api_key
-                os.environ["ALPACA_API_SECRET"] = new_api_secret
-                
-                # Create or update .env file
-                with open(".env", "w") as f:
-                    f.write(f"ALPACA_API_KEY={new_api_key}\n")
-                    f.write(f"ALPACA_API_SECRET={new_api_secret}\n")
-                
-                st.success("API keys saved successfully!")
-                st.experimental_rerun()
-            else:
-                st.error("Both API Key and Secret are required")
+    This application now uses Yahoo Finance data, which doesn't require API keys.
     
-    # Provide info about how to get API keys
-    with st.expander("How to get Alpaca API keys"):
-        st.markdown("""
-        1. Create an account at [Alpaca](https://app.alpaca.markets/signup)
-        2. Navigate to Paper Trading in your dashboard
-        3. Click on "Generate New Key"
-        4. Copy the API Key and Secret Key
-        
-        You can use the Paper Trading API for free to access market data and practice trading.
-        """)
+    Simply click the 'Continue to App' button below to start using the application.
+    """)
+    
+    if st.button("Continue to App", use_container_width=True):
+        # Store a flag in the session to skip this page next time
+        st.session_state.api_keys_configured = True
+        # Rerun the script to refresh
+        st.experimental_rerun()
 
-def init_alpaca_client():
-    """Initialize Alpaca API client"""
-    api_key = os.environ.get("ALPACA_API_KEY")
-    api_secret = os.environ.get("ALPACA_API_SECRET")
-    
-    if not api_key or not api_secret:
-        st.sidebar.error("Alpaca API keys not found. Please set ALPACA_API_KEY and ALPACA_API_SECRET in .env file")
-        # Create expandable section to configure API keys
-        with st.sidebar.expander("Configure Alpaca API Keys"):
-            api_key = st.text_input("Alpaca API Key", type="password", 
-                                     value=api_key if api_key else "", key="sidebar_api_key")
-            api_secret = st.text_input("Alpaca API Secret", type="password", 
-                                        value=api_secret if api_secret else "", key="sidebar_api_secret")
-            if st.button("Save API Keys"):
-                if api_key and api_secret:
-                    os.environ["ALPACA_API_KEY"] = api_key
-                    os.environ["ALPACA_API_SECRET"] = api_secret
-                    st.success("API keys saved for this session")
-                else:
-                    st.error("Both API Key and Secret are required")
-    
+def init_data_client():
+    """Initialize data client - in this case, we use Yahoo Finance which requires no authentication"""
     try:
-        data_client = StockHistoricalDataClient(api_key, api_secret)
-        trading_client = TradingClient(api_key, api_secret, paper=True)
-        return data_client, trading_client
+        # Test the connection by getting a small amount of data
+        test_data = yf.download("SPY", period="1d", interval="1h")
+        if test_data is None or test_data.empty:
+            st.sidebar.warning("Unable to fetch test data from Yahoo Finance. Check your internet connection.")
+            return False
+        return True
     except Exception as e:
-        st.sidebar.error(f"Error initializing Alpaca client: {str(e)}")
-        return None, None
+        error_msg = str(e)
+        st.sidebar.error(f"⚠️ Error initializing Yahoo Finance connection: {error_msg}")
+        return False
 
-def fetch_data(symbol, exchange, timeframe, period='3mo'):
+def fetch_data(symbol, exchange=None, timeframe="1d", period="3mo"):
     """
-    Fetch market data from various sources
+    Fetch market data from Yahoo Finance
     
     Args:
         symbol (str): Trading symbol
-        exchange (str): Exchange name
-        timeframe (str): Data timeframe
-        period (str): Period to fetch
+        exchange (str): Not used, included for backward compatibility
+        timeframe (str): Data timeframe (1m, 5m, 15m, 30m, 1h, 1d)
+        period (str): Period to fetch (1d, 5d, 1mo, 3mo, 6mo, 1y, 2y, max)
         
     Returns:
         pd.DataFrame: OHLCV data
     """
     try:
-        # For stock market data, use Alpaca
-        if exchange in ['NASDAQ', 'NYSE', 'AMEX']:
-            # Initialize Alpaca client
-            data_client, _ = init_alpaca_client()
-            if not data_client:
-                st.error("Alpaca client not initialized. Please check API keys.")
-                return None
-            
-            # Convert timeframe string to Alpaca TimeFrame format
-            original_timeframe = timeframe
-            
-            # Parse the timeframe string to extract number and unit
-            if timeframe.endswith('m'):
-                if timeframe == '1m':
-                    alpaca_timeframe = AlpacaTimeFrame(1, AlpacaTimeFrame.Minute)
-                elif timeframe == '5m':
-                    # Will resample 1-minute data to 5m later for some period lengths
-                    alpaca_timeframe = AlpacaTimeFrame(5, AlpacaTimeFrame.Minute)
-                elif timeframe == '15m':
-                    alpaca_timeframe = AlpacaTimeFrame(15, AlpacaTimeFrame.Minute)
-                elif timeframe == '30m':
-                    alpaca_timeframe = AlpacaTimeFrame(30, AlpacaTimeFrame.Minute)
-                else:
-                    # Default to minute for unknown minute-based timeframes
-                    alpaca_timeframe = AlpacaTimeFrame(1, AlpacaTimeFrame.Minute)
-            elif timeframe.endswith('h'):
-                if timeframe == '1h':
-                    alpaca_timeframe = AlpacaTimeFrame(1, AlpacaTimeFrame.Hour)
-                elif timeframe == '4h':
-                    alpaca_timeframe = AlpacaTimeFrame(4, AlpacaTimeFrame.Hour)
-                else:
-                    alpaca_timeframe = AlpacaTimeFrame(1, AlpacaTimeFrame.Hour)
-            elif timeframe == '1d':
-                alpaca_timeframe = AlpacaTimeFrame(1, AlpacaTimeFrame.Day)
-            else:
-                # Default to 1 Hour for unknown timeframes
-                alpaca_timeframe = AlpacaTimeFrame(1, AlpacaTimeFrame.Hour)
-                st.warning(f"Unknown timeframe format: {timeframe}. Using 1 Hour as default.")
-            
-            # Calculate start and end times based on period
-            # For free accounts, we need to use data that's at least 15 minutes old
-            # Use Eastern Time (ET) instead of UTC
-            eastern_tz = pytz.timezone('US/Eastern')
-            current_time = datetime.now(eastern_tz)
-            
-            # Create end time 16 minutes in the past to comply with Alpaca free tier
-            end = current_time - timedelta(minutes=16)
-            
-            if period == '1d':
-                start = end - timedelta(days=1)
-            elif period == '5d':
-                start = end - timedelta(days=5)
-            elif period == '1wk':
-                start = end - timedelta(weeks=1)
-            elif period == '1mo':
-                start = end - timedelta(days=30)
-            elif period == '3mo':
-                start = end - timedelta(days=90)
-            elif period == '6mo':
-                start = end - timedelta(days=180)
-            elif period == '1y':
-                start = end - timedelta(days=365)
-            else:
-                start = end - timedelta(days=90)  # Default to 3 months
-            
-            # Adjust timeframe based on period length to avoid hitting limits
-            if (end - start).days > 30 and alpaca_timeframe.value == AlpacaTimeFrame.Minute.value:
-                # Use hourly data for periods > 30 days if minute data was requested
-                alpaca_timeframe = AlpacaTimeFrame(1, AlpacaTimeFrame.Hour)
-                st.info(f"Switched to hourly data for {timeframe} due to long period ({period})")
-            elif (end - start).days > 90 and alpaca_timeframe.value == AlpacaTimeFrame.Hour.value:
-                # Use daily data for periods > 90 days
-                alpaca_timeframe = AlpacaTimeFrame(1, AlpacaTimeFrame.Day)
-                st.info(f"Switched to daily data for {timeframe} due to long period ({period})")
-            
-            # Create request with proper timeframe
-            request_params = StockBarsRequest(
-                symbol_or_symbols=[symbol],
-                timeframe=alpaca_timeframe,
-                start=start,
-                end=end,
-                adjustment='all'
-            )
-            
-            try:
-                # Fetch bars data
-                bars = data_client.get_stock_bars(request_params)
-                
-                # Convert to dataframe
-                if bars and bars.data and symbol in bars.data:
-                    df = bars.df.loc[symbol].copy()
-                    
-                    # Rename columns to match expected format
-                    df = df.rename(columns={
-                        'open': 'open',
-                        'high': 'high', 
-                        'low': 'low',
-                        'close': 'close',
-                        'volume': 'volume',
-                        'trade_count': 'trade_count',
-                        'vwap': 'vwap'
-                    })
-                    
-                    # Resample to the original requested timeframe if needed
-                    if original_timeframe == '5m' and alpaca_timeframe.value == AlpacaTimeFrame.Minute.value and alpaca_timeframe.amount == 1:
-                        df = df.resample('5T').agg({
-                            'open': 'first',
-                            'high': 'max',
-                            'low': 'min',
-                            'close': 'last',
-                            'volume': 'sum'
-                        }).dropna()
-                    elif original_timeframe == '15m' and alpaca_timeframe.value == AlpacaTimeFrame.Minute.value and alpaca_timeframe.amount == 1:
-                        df = df.resample('15T').agg({
-                            'open': 'first',
-                            'high': 'max',
-                            'low': 'min',
-                            'close': 'last',
-                            'volume': 'sum'
-                        }).dropna()
-                    elif original_timeframe == '30m' and alpaca_timeframe.value == AlpacaTimeFrame.Minute.value and alpaca_timeframe.amount == 1:
-                        df = df.resample('30T').agg({
-                            'open': 'first',
-                            'high': 'max',
-                            'low': 'min',
-                            'close': 'last',
-                            'volume': 'sum'
-                        }).dropna()
-                    elif original_timeframe == '1h' and alpaca_timeframe.value == AlpacaTimeFrame.Minute.value:
-                        df = df.resample('1H').agg({
-                            'open': 'first',
-                            'high': 'max',
-                            'low': 'min',
-                            'close': 'last',
-                            'volume': 'sum'
-                        }).dropna()
-                    elif original_timeframe == '2h' and alpaca_timeframe.value == AlpacaTimeFrame.Hour.value and alpaca_timeframe.amount == 1:
-                        df = df.resample('2H').agg({
-                            'open': 'first',
-                            'high': 'max',
-                            'low': 'min',
-                            'close': 'last',
-                            'volume': 'sum'
-                        }).dropna()
-                    elif original_timeframe == '4h' and alpaca_timeframe.value == AlpacaTimeFrame.Hour.value and alpaca_timeframe.amount == 1:
-                        df = df.resample('4H').agg({
-                            'open': 'first',
-                            'high': 'max',
-                            'low': 'min',
-                            'close': 'last',
-                            'volume': 'sum'
-                        }).dropna()
-                    
-                    return df
-                else:
-                    st.error(f"No data returned for {symbol}")
-                    return None
-            except Exception as e:
-                error_msg = str(e)
-                if "subscription does not permit" in error_msg:
-                    st.error("Your Alpaca account subscription doesn't permit access to this data.")
-                    st.info("Trying with a longer delay or older data...")
-                    
-                    # Try with a longer delay (15 hours ago)
-                    eastern_tz = pytz.timezone('US/Eastern')
-                    current_time = datetime.now(eastern_tz)
-                    end_older = current_time - timedelta(hours=15)
-                    start_older = end_older - timedelta(days=30)
-                    
-                    # Use daily timeframe for older data
-                    request_params = StockBarsRequest(
-                        symbol_or_symbols=[symbol],
-                        timeframe=AlpacaTimeFrame(1, AlpacaTimeFrame.Day),
-                        start=start_older,
-                        end=end_older,
-                        adjustment='all'
-                    )
-                    
-                    try:
-                        bars = data_client.get_stock_bars(request_params)
-                        if bars and bars.data and symbol in bars.data:
-                            df = bars.df.loc[symbol].copy()
-                            st.success(f"Successfully retrieved historical data for {symbol}")
-                            return df
-                        else:
-                            st.error(f"No historical data available for {symbol}")
-                            return None
-                    except Exception as e2:
-                        st.error(f"Error accessing historical data: {str(e2)}")
-                        st.info("Loading sample data instead")
-                        return load_sample_data(symbol, timeframe, period)
-                else:
-                    st.error(f"Error fetching data: {error_msg}")
-                    return None
-        
-        # For crypto exchanges
-        elif exchange in ['BINANCE', 'COINBASE', 'FTX']:
-            # Initialize the exchange
-            if exchange == 'BINANCE':
-                ex = ccxt.binance()
-            elif exchange == 'COINBASE':
-                ex = ccxt.coinbasepro()
-            elif exchange == 'FTX':
-                ex = ccxt.ftx()
-            
-            # Convert timeframe to exchange format
-            if timeframe == '1':
-                tf = '1m'
-            elif timeframe == '5':
-                tf = '5m'
-            elif timeframe == '15':
-                tf = '15m'
-            elif timeframe == '30':
-                tf = '30m'
-            elif timeframe == '60':
-                tf = '1h'
-            elif timeframe == 'D':
-                tf = '1d'
-            elif timeframe == 'W':
-                tf = '1w'
-            else:
-                tf = '1h'
-            
-            # Calculate start time based on period
-            if period == '1d':
-                start_time = datetime.now() - timedelta(days=1)
-            elif period == '1wk':
-                start_time = datetime.now() - timedelta(weeks=1)
-            elif period == '1mo':
-                start_time = datetime.now() - timedelta(days=30)
-            elif period == '3mo':
-                start_time = datetime.now() - timedelta(days=90)
-            else:
-                start_time = datetime.now() - timedelta(days=30)
-            
-            # Convert to millisecond timestamp
-            since = int(start_time.timestamp() * 1000)
-            
-            # Fetch OHLCV data
-            ohlcv = ex.fetch_ohlcv(symbol + '/USDT', tf, since=since)
-            
-            # Convert to DataFrame
-            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-            df.set_index('timestamp', inplace=True)
-            
-            return df
-        
+        # Map timeframes to Yahoo Finance intervals
+        yahoo_interval = timeframe
+        if timeframe == '1d':
+            yahoo_interval = '1d'
+        elif timeframe == '1h':
+            yahoo_interval = '60m'
+        elif timeframe == '4h':
+            # Yahoo doesn't have 4h directly, use 1h and we'll resample later
+            yahoo_interval = '60m'
+        elif timeframe == '30m':
+            yahoo_interval = '30m'
+        elif timeframe == '15m':
+            yahoo_interval = '15m'
+        elif timeframe == '5m':
+            yahoo_interval = '5m'
+        elif timeframe == '1m':
+            yahoo_interval = '1m'
         else:
-            st.error(f"Unsupported exchange: {exchange}")
+            # Default to 1h for unknown timeframes
+            yahoo_interval = '60m'
+            st.warning(f"Unknown timeframe format: {timeframe}. Using 1 Hour as default.")
+            
+        # Map period strings to Yahoo Finance periods
+        yahoo_period = period
+        if period == '1wk':
+            yahoo_period = '5d'  # Use 5d for 1 week
+            
+        # For 1m data, Yahoo only allows 7 days max
+        if yahoo_interval == '1m' and period not in ['1d', '5d', '7d']:
+            st.warning(f"Yahoo Finance only provides 1-minute data for up to 7 days. Using 7d period instead of {period}.")
+            yahoo_period = '7d'
+            
+        # Fetch data from Yahoo Finance
+        with st.spinner(f"Fetching {symbol} data from Yahoo Finance..."):
+            stock = yf.Ticker(symbol)
+            df = stock.history(period=yahoo_period, interval=yahoo_interval)
+            
+        # Check if we got data
+        if df.empty:
+            st.error(f"No data returned from Yahoo Finance for {symbol}")
             return None
             
+        # Rename columns to match our expected format
+        df.columns = [c.lower() for c in df.columns]
+        
+        # Resample if we need to convert 1h to 4h
+        if timeframe == '4h' and yahoo_interval == '60m':
+            df = df.resample('4H').agg({
+                'open': 'first',
+                'high': 'max',
+                'low': 'min',
+                'close': 'last',
+                'volume': 'sum'
+            }).dropna()
+            
+        # Add a timestamp column (mainly for display)
+        # Convert timestamps to Eastern Time for display
+        if isinstance(df.index[0], pd.Timestamp):
+            eastern = pytz.timezone('US/Eastern')
+            if df.index[0].tzinfo is not None:
+                # Convert existing timezone to Eastern
+                df.index = df.index.tz_convert(eastern)
+            else:
+                # Add timezone info if missing
+                df.index = df.index.tz_localize('UTC').tz_convert(eastern)
+                
+        return df
     except Exception as e:
-        st.error(f"Error fetching data: {str(e)}")
+        st.error(f"Error fetching {symbol} data: {str(e)}")
+        traceback.print_exc()
         return None
 
 def load_sample_data(symbol="AAPL", timeframe="1d", period="3mo"):
@@ -410,132 +183,260 @@ def load_sample_data(symbol="AAPL", timeframe="1d", period="3mo"):
         pd.DataFrame: OHLCV data
     """
     try:
-        # Initialize Alpaca client
-        data_client, _ = init_alpaca_client()
-        if not data_client:
-            st.error("Alpaca client not initialized. Please check API keys.")
-            # Fall back to a basic sample dataset if Alpaca is not available
-            eastern_tz = pytz.timezone('US/Eastern')
-            current_time = datetime.now(eastern_tz)
-            dates = pd.date_range(end=current_time, periods=90)
-            data = pd.DataFrame({
-                'open': np.random.normal(100, 5, 90),
-                'high': np.random.normal(105, 5, 90),
-                'low': np.random.normal(95, 5, 90),
-                'close': np.random.normal(100, 5, 90),
-                'volume': np.random.normal(1000000, 200000, 90),
-            }, index=dates)
-            for i in range(1, len(data)):
-                data.loc[data.index[i], 'open'] = data.loc[data.index[i-1], 'close']
-                data.loc[data.index[i], 'high'] = max(data.loc[data.index[i], 'open'], data.loc[data.index[i], 'close']) + np.random.normal(2, 0.5)
-                data.loc[data.index[i], 'low'] = min(data.loc[data.index[i], 'open'], data.loc[data.index[i], 'close']) - np.random.normal(2, 0.5)
-            return data
-        
-        # Request data based on symbol - use data that's 16 minutes old for free accounts
+        # Create synthetic data with realistic patterns
         eastern_tz = pytz.timezone('US/Eastern')
         current_time = datetime.now(eastern_tz)
-        end = current_time - timedelta(minutes=16)
         
-        # Calculate start time based on period
+        # Determine number of data points based on period and timeframe
         if period == '1d':
-            start = end - timedelta(days=1)
+            periods = 1 * 24  # 1 day
         elif period == '5d':
-            start = end - timedelta(days=5)
+            periods = 5 * 24  # 5 days
         elif period == '1mo':
-            start = end - timedelta(days=30)
+            periods = 30 * 24  # 1 month
         elif period == '3mo':
-            start = end - timedelta(days=90)
+            periods = 90 * 24  # 3 months
         elif period == '6mo':
-            start = end - timedelta(days=180)
+            periods = 180 * 24  # 6 months
         elif period == '1y':
-            start = end - timedelta(days=365)
+            periods = 365 * 24  # 1 year
         else:
-            start = end - timedelta(days=90)  # Default to 3 months
+            periods = 90 * 24  # Default to 3 months
         
-        # Convert timeframe to Alpaca format
-        if timeframe.endswith('m'):
-            if timeframe == '1m':
-                alpaca_timeframe = AlpacaTimeFrame(1, AlpacaTimeFrame.Minute)
-            elif timeframe == '5m':
-                alpaca_timeframe = AlpacaTimeFrame(5, AlpacaTimeFrame.Minute)
-            elif timeframe == '15m':
-                alpaca_timeframe = AlpacaTimeFrame(15, AlpacaTimeFrame.Minute)
-            elif timeframe == '30m':
-                alpaca_timeframe = AlpacaTimeFrame(30, AlpacaTimeFrame.Minute)
-            else:
-                alpaca_timeframe = AlpacaTimeFrame(1, AlpacaTimeFrame.Minute)
-        elif timeframe.endswith('h'):
-            if timeframe == '1h':
-                alpaca_timeframe = AlpacaTimeFrame(1, AlpacaTimeFrame.Hour)
-            elif timeframe == '4h':
-                alpaca_timeframe = AlpacaTimeFrame(4, AlpacaTimeFrame.Hour)
-            else:
-                alpaca_timeframe = AlpacaTimeFrame(1, AlpacaTimeFrame.Hour)
+        # Adjust frequency based on timeframe
+        if timeframe == '1m':
+            freq = '1min'
+            periods = min(periods * 60, 1000)  # Cap at 1000 points
+        elif timeframe == '5m':
+            freq = '5min'
+            periods = min(periods * 12, 1000)
+        elif timeframe == '15m':
+            freq = '15min'
+            periods = min(periods * 4, 1000)
+        elif timeframe == '30m':
+            freq = '30min'
+            periods = min(periods * 2, 1000)
+        elif timeframe == '1h':
+            freq = '1H'
+        elif timeframe == '4h':
+            freq = '4H'
+            periods = periods // 4
         elif timeframe == '1d':
-            alpaca_timeframe = AlpacaTimeFrame(1, AlpacaTimeFrame.Day)
+            freq = 'B'  # Business day frequency
+            periods = periods // 24
         else:
-            # Default to daily data
-            alpaca_timeframe = AlpacaTimeFrame(1, AlpacaTimeFrame.Day)
-        
-        # Request params based on the provided symbol
-        request_params = StockBarsRequest(
-            symbol_or_symbols=[symbol],
-            timeframe=alpaca_timeframe,
-            start=start,
-            end=end,
-            adjustment='all'
-        )
-        
-        # Fetch bars data
-        bars = data_client.get_stock_bars(request_params)
-        
-        # Convert to dataframe
-        if bars and bars.data and symbol in bars.data:
-            df = bars.df.loc[symbol].copy()
+            freq = '1H'  # Default to hourly
             
-            # Rename columns to match expected format
-            df = df.rename(columns={
-                'open': 'open',
-                'high': 'high', 
-                'low': 'low',
-                'close': 'close',
-                'volume': 'volume',
-                'trade_count': 'trade_count',
-                'vwap': 'vwap'
-            })
+        # Create dates - business days only, during market hours
+        end_date = current_time.replace(hour=16, minute=0)
+        
+        if freq in ['1min', '5min', '15min', '30min', '1H', '4H']:
+            # For intraday data, create timestamps during market hours (9:30 AM - 4:00 PM ET)
+            market_days = pd.date_range(
+                end=end_date, 
+                periods=min(periods // 8 + 1, 90),  # At most 90 days
+                freq=pd.tseries.offsets.BDay(),  # Business day frequency
+            )
             
-            return df
+            # For each day, create timestamps during market hours
+            market_hours_timestamps = []
+            for day in market_days:
+                # Create timestamps for this day based on frequency
+                day_start = day.replace(hour=9, minute=30)
+                day_end = day.replace(hour=16, minute=0)
+                
+                if freq == '1min':
+                    day_timestamps = pd.date_range(start=day_start, end=day_end, freq='1min')
+                elif freq == '5min':
+                    day_timestamps = pd.date_range(start=day_start, end=day_end, freq='5min')
+                elif freq == '15min':
+                    day_timestamps = pd.date_range(start=day_start, end=day_end, freq='15min')
+                elif freq == '30min':
+                    day_timestamps = pd.date_range(start=day_start, end=day_end, freq='30min')
+                elif freq == '1H':
+                    day_timestamps = pd.date_range(start=day_start, end=day_end, freq='1H')
+                elif freq == '4H':
+                    # Only 2 4H candles per day (9:30-13:30, 13:30-16:00)
+                    day_timestamps = [day_start, day_start + pd.Timedelta(hours=4)]
+                
+                market_hours_timestamps.extend(day_timestamps)
+            
+            # Sort timestamps and take the most recent ones
+            market_hours_timestamps.sort()
+            dates = market_hours_timestamps[-periods:]  # Take last N timestamps
         else:
-            raise Exception(f"No sample data available from Alpaca for {symbol}")
+            # For daily data, use business days
+            dates = pd.date_range(
+                end=end_date, 
+                periods=periods,
+                freq='B',  # Business day frequency
+            )
+        
+        # Generate more realistic price data based on the symbol
+        base_price = 150  # Default base price
+        
+        # Use realistic price range based on symbol
+        if symbol.upper() == "AAPL":
+            base_price = 190
+        elif symbol.upper() == "MSFT":
+            base_price = 420
+        elif symbol.upper() == "GOOGL":
+            base_price = 170
+        elif symbol.upper() == "AMZN":
+            base_price = 180
+        elif symbol.upper() == "META":
+            base_price = 500
+        elif symbol.upper() == "TSLA":
+            base_price = 220
+        elif symbol.upper() == "NVDA":
+            base_price = 940
+        elif symbol.upper() == "SPY":
+            base_price = 550
+            
+        # Generate data with realistic price movement
+        data = pd.DataFrame(index=dates)
+        
+        # Create realistic price movement with random walk and slight upward bias
+        price = base_price
+        closes = []
+        for i in range(len(dates)):
+            # Random walk with slight upward bias
+            price_change = np.random.normal(0.0001, 0.002)  # Slight upward bias
+            price *= (1 + price_change)
+            closes.append(price)
+        
+        data['close'] = closes
+        
+        # Generate open, high, low based on close
+        # For the first point, use same value
+        data['open'] = [closes[0]] + closes[:-1]
+        
+        # Generate highs and lows with reasonable ranges
+        highs = []
+        lows = []
+        
+        for i in range(len(closes)):
+            open_price = data['open'].iloc[i]
+            close_price = data['close'].iloc[i]
+            
+            # Determine candle direction
+            if close_price > open_price:
+                # Bullish candle
+                high = close_price * (1 + abs(np.random.normal(0, 0.001)))
+                low = open_price * (1 - abs(np.random.normal(0, 0.001)))
+            else:
+                # Bearish candle
+                high = open_price * (1 + abs(np.random.normal(0, 0.001)))
+                low = close_price * (1 - abs(np.random.normal(0, 0.001)))
+                
+            highs.append(high)
+            lows.append(low)
+        
+        data['high'] = highs
+        data['low'] = lows
+        
+        # Generate realistic volume
+        base_volume = 1000000  # Default base volume
+        
+        # Adjust volume based on symbol
+        if symbol.upper() in ["AAPL", "MSFT", "AMZN", "GOOGL", "META", "TSLA", "NVDA"]:
+            base_volume = 5000000
+        elif symbol.upper() == "SPY":
+            base_volume = 50000000
+            
+        # Generate volume with daily pattern (higher at open and close)
+        volumes = []
+        for date in dates:
+            # Higher volume at market open and close
+            hour = date.hour
+            minute = date.minute
+            
+            # Base multiplier
+            vol_mult = 1.0
+            
+            # Adjust volume based on time of day
+            if hour == 9 and minute == 30:
+                vol_mult = 1.5  # Higher volume at market open
+            elif hour >= 15:
+                vol_mult = 1.3  # Higher volume toward market close
+                
+            # Add some randomness
+            vol_mult *= np.random.normal(1, 0.2)
+            
+            # Floor at 0.5
+            vol_mult = max(0.5, vol_mult)
+            
+            volume = int(base_volume * vol_mult)
+            volumes.append(volume)
+            
+        data['volume'] = volumes
+        
+        # Add timezone information to index
+        data.index = data.index.tz_localize(eastern_tz)
+        
+        st.warning(f"Using synthetic sample data for {symbol}. This data is generated and does not reflect actual market prices.")
+        return data
             
     except Exception as e:
-        st.error(f"Error loading sample data: {str(e)}")
-        # Create synthetic sample data as fallback
-        eastern_tz = pytz.timezone('US/Eastern')
-        current_time = datetime.now(eastern_tz)
-        dates = pd.date_range(end=current_time, periods=90)
-        data = pd.DataFrame({
-            'open': np.random.normal(100, 5, 90),
-            'high': np.random.normal(105, 5, 90),
-            'low': np.random.normal(95, 5, 90),
-            'close': np.random.normal(100, 5, 90),
-            'volume': np.random.normal(1000000, 200000, 90),
-        }, index=dates)
-        for i in range(1, len(data)):
-            data.loc[data.index[i], 'open'] = data.loc[data.index[i-1], 'close']
-            data.loc[data.index[i], 'high'] = max(data.loc[data.index[i], 'open'], data.loc[data.index[i], 'close']) + np.random.normal(2, 0.5)
-            data.loc[data.index[i], 'low'] = min(data.loc[data.index[i], 'open'], data.loc[data.index[i], 'close']) - np.random.normal(2, 0.5)
+        st.error(f"Error generating sample data: {str(e)}")
+        traceback.print_exc()
+        
+        # Create very basic fallback if everything else fails
+        dates = pd.date_range(
+            end=datetime.now(), 
+            periods=100,
+            freq='H'
+        )
+        
+        data = pd.DataFrame(index=dates)
+        data['close'] = np.linspace(100, 110, len(dates)) + np.random.normal(0, 1, len(dates))
+        data['open'] = data['close'].shift(1).fillna(data['close'].iloc[0])
+        data['high'] = data[['open', 'close']].max(axis=1) + abs(np.random.normal(0, 0.5, len(dates)))
+        data['low'] = data[['open', 'close']].min(axis=1) - abs(np.random.normal(0, 0.5, len(dates)))
+        data['volume'] = np.random.randint(100000, 1000000, size=len(data))
+        
         return data
+
+def fetch_yahoo_data(symbol, period='1d', interval='1m'):
+    """
+    Fetch data from Yahoo Finance
+    
+    Args:
+        symbol (str): Trading symbol
+        period (str): Period to fetch (1d, 5d, 1mo, 3mo, 6mo, 1y, 2y, 5y, ytd, max)
+        interval (str): Data interval (1m, 2m, 5m, 15m, 30m, 60m, 90m, 1h, 1d, 5d, 1wk, 1mo, 3mo)
+        
+    Returns:
+        pd.DataFrame: OHLCV data
+    """
+    try:
+        # For 1m data, Yahoo only allows 7 days max
+        if interval == '1m' and period not in ['1d', '5d', '7d']:
+            st.warning(f"Yahoo Finance only provides 1-minute data for up to 7 days. Using 1d period instead of {period}.")
+            period = '1d'
+            
+        # Add a day to ensure we get the most recent data
+        stock = yf.Ticker(symbol)
+        df = stock.history(period=period, interval=interval)
+        
+        if df.empty:
+            st.error(f"No data returned from Yahoo Finance for {symbol}")
+            return None
+            
+        # Rename columns to match our expected format if needed
+        df.columns = [c.lower() for c in df.columns]
+        
+        return df
+        
+    except Exception as e:
+        st.error(f"Error fetching data from Yahoo Finance: {str(e)}")
+        return None
 
 def main():
     """Main function to run the Day Trading Helper application"""
     
-    # Check if API keys are configured
-    api_key = os.environ.get("ALPACA_API_KEY")
-    api_secret = os.environ.get("ALPACA_API_SECRET")
-    
-    if not api_key or not api_secret:
-        # Show API configuration screen if keys are missing
+    # Check if API key configuration should be shown
+    if not st.session_state.get('api_keys_configured', False):
         configure_api_keys()
         return
     
@@ -544,6 +445,15 @@ def main():
         st.title("Day Trading Helper")
         st.subheader("Configuration")
         
+        # Display data source indicator in sidebar
+        if 'data' in st.session_state and st.session_state.data is not None:
+            if hasattr(st.session_state, 'using_sample_data') and st.session_state.using_sample_data:
+                st.sidebar.error("⚠️ USING SAMPLE DATA", icon="⚠️")
+            elif hasattr(st.session_state, 'data_source_type') and "Sample" in st.session_state.data_source_type:
+                st.sidebar.error("⚠️ USING SAMPLE DATA", icon="⚠️")
+            else:
+                st.sidebar.success("✅ USING REAL DATA", icon="✅")
+        
         # Create tabs for different configuration sections
         config_tabs = st.tabs(["Data Source", "Analysis", "Tools"])
         
@@ -551,22 +461,19 @@ def main():
             # Data source selection
             data_source = st.selectbox(
                 "Select Data Source",
-                ["Alpaca API", "Sample Data"],  # Add back real data sources
+                ["Yahoo Finance", "Sample Data"],
                 index=0
             )
             
+            # Add a note about Yahoo Finance data
+            if data_source == "Yahoo Finance":
+                st.info("📊 **Yahoo Finance:**\n"
+                       "- For 1-minute data, only last 7 days available\n"
+                       "- No authentication required\n"
+                       "- 15+ minute delay for real-time data", icon="ℹ️")
+            
             # Symbol selection
             symbol = st.text_input("Symbol", "AAPL").upper()
-            
-            # Exchange selection (only show if using real data)
-            if data_source == "Alpaca API":
-                exchange = st.selectbox(
-                    "Exchange",
-                    ["NASDAQ", "NYSE", "AMEX"],
-                    index=0
-                )
-            else:
-                exchange = "NASDAQ"  # Default for sample data
             
             # Timeframe selection
             timeframe = st.selectbox(
@@ -576,8 +483,8 @@ def main():
             )
             
             # Period selection
-            period_options = ["1d", "5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "all"]
-            period = st.selectbox("Select Period", period_options, index=3)
+            period_options = ["1d", "5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "max"]
+            period = st.selectbox("Select Period", period_options, index=1)
             
             # Add single day trading mode option
             st.divider()
@@ -618,487 +525,376 @@ def main():
                         else:
                             st.session_state['use_spy_strategy'] = False
                         
+                        # Reset sample data flag
+                        st.session_state.using_sample_data = False
+                        
                         # Load data based on selected source
                         if data_source == "Sample Data":
                             st.session_state.data = load_sample_data(symbol, timeframe, period)
-                        else:
-                            st.session_state.data = fetch_data(symbol, exchange, timeframe, period)
-                            if st.session_state.data is None:
-                                st.error(f"Failed to fetch data for {symbol} from Alpaca API. Falling back to sample data.")
+                            st.session_state.using_sample_data = True
+                            st.session_state.data_source_type = "Sample Data"
+                            st.success(f"Successfully loaded sample data for {symbol}")
+                        elif data_source == "Yahoo Finance":
+                            # Get Yahoo Finance data
+                            yahoo_data = fetch_data(symbol, None, timeframe, period)
+                            if yahoo_data is not None and not yahoo_data.empty:
+                                st.session_state.data = yahoo_data
+                                st.session_state.data_source_type = "Yahoo Finance"
+                                st.success(f"Successfully loaded data from Yahoo Finance")
+                            else:
+                                st.warning("Could not fetch data from Yahoo Finance. Falling back to sample data.")
                                 st.session_state.data = load_sample_data(symbol, timeframe, period)
+                                st.session_state.using_sample_data = True
+                                st.session_state.data_source_type = "Sample Data (Fallback)"
                         
+                        # Store symbol, timeframe and period in session state for reference
                         st.session_state.symbol = symbol
                         st.session_state.timeframe = timeframe
-                        st.session_state.signals = None  # Reset signals when new data is loaded
+                        st.session_state.period = period
                         
-                        # Show success message for data loading
-                        st.success(f"Successfully loaded {symbol} data for {timeframe} timeframe")
+                        # Clear any previous signals
+                        if 'signals' in st.session_state:
+                            del st.session_state.signals
                     except Exception as e:
                         st.error(f"Error loading data: {str(e)}")
-                        st.session_state.data = None
-            
-            # Add Alpaca API configuration button
-            if st.button("Configure API Keys"):
-                configure_api_keys()
-                st.experimental_rerun()
+                        traceback.print_exc()
         
         with config_tabs[1]:
-            # Analysis options
-            show_signals = st.checkbox("Show Trading Signals", value=True)
-            show_patterns = st.checkbox("Show Chart Patterns", value=True)
+            # Signal analysis options
+            st.subheader("Signal Options")
             
-            # Add market hours filter for signals
-            market_hours_filter = st.checkbox("Filter Signals to Market Hours", value=True)
+            # Add market hours filter option
+            market_hours_filter = st.checkbox("Filter for Market Hours", value=True,
+                                            help="Only analyze data during market hours (9:30 AM - 4:00 PM ET)")
             
-            # Add volatility threshold
-            volatility_threshold = st.slider(
-                "Volatility Threshold",
-                min_value=0.0,
-                max_value=5.0,
-                value=1.0,
-                step=0.1,
-                help="Minimum ATR percentage for signal generation"
-            )
+            # Save market hours filter setting to session state
+            st.session_state.market_hours_filter = market_hours_filter
+            
+            # Add strategy options
+            st.subheader("Strategy Options")
+            
+            # Display different options based on whether SPY strategy is enabled
+            if hasattr(st.session_state, 'use_spy_strategy') and st.session_state.use_spy_strategy:
+                st.info("Using SPY-specific strategy settings")
+                
+                # Let user select emphasis on specific signals
+                signal_emphasis = st.select_slider(
+                    "Signal Emphasis",
+                    options=["Conservative", "Balanced", "Aggressive"],
+                    value="Balanced"
+                )
+                
+                st.session_state.signal_emphasis = signal_emphasis
+            else:
+                # Standard strategy options
+                st.info("Using standard technical analysis strategy")
+                
+                # Let user select which indicator types to prioritize
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    trend_weight = st.slider("Trend Indicators", 0.0, 2.0, 1.0, 0.1,
+                                          help="Weight for trend-following indicators like moving averages")
+                    
+                    momentum_weight = st.slider("Momentum Indicators", 0.0, 2.0, 1.0, 0.1,
+                                             help="Weight for momentum indicators like RSI and MACD")
+                
+                with col2:
+                    volatility_weight = st.slider("Volatility Indicators", 0.0, 2.0, 1.0, 0.1,
+                                               help="Weight for volatility indicators like Bollinger Bands")
+                    
+                    volume_weight = st.slider("Volume Indicators", 0.0, 2.0, 1.0, 0.1,
+                                           help="Weight for volume-based indicators")
+                
+                # Save weights to session state
+                st.session_state.weights = {
+                    'trend': trend_weight,
+                    'momentum': momentum_weight,
+                    'volatility': volatility_weight,
+                    'volume': volume_weight
+                }
         
         with config_tabs[2]:
-            # Trading tools
-            st.subheader("Trading Tools")
-            risk_per_trade = st.slider("Risk per Trade (%)", 0.5, 5.0, 1.0, 0.1)
-            stop_loss_atr = st.slider("Stop Loss (ATR Multiple)", 1.0, 5.0, 2.0, 0.5)
-            take_profit_ratio = st.slider("Risk:Reward Ratio", 1.0, 5.0, 2.0, 0.5)
+            # Tools tab
+            st.subheader("Utility Tools")
             
-            # Backtest settings
-            st.subheader("Backtesting")
-            strategy = st.selectbox(
-                "Backtest Strategy",
-                ["Signal-based", "Moving Average Crossover", "RSI Oscillator"]
-            )
+            # Backtesting option
+            enable_backtest = st.checkbox("Enable Backtesting", value=False,
+                                        help="Simulate trading using generated signals")
             
-            # Notification settings
-            st.subheader("Notifications")
-            enable_notifications = st.checkbox("Enable Alert Notifications")
-        
-        # Navigation links
-        st.sidebar.markdown("---")
-        st.sidebar.subheader("Navigation")
-        st.sidebar.markdown("[📊 Dashboard](http://localhost:8501/)")
-        st.sidebar.markdown("[🔍 Signal Analysis](/Signal_Analysis)")
-        st.sidebar.markdown("[⚖️ Risk Calculator](/Risk_Calculator)")
-        
-        # Add app information
-        st.sidebar.markdown("---")
-        st.sidebar.info(
-            "This application helps day traders analyze stocks, "
-            "generate trading signals, and manage risk effectively."
-        )
-        st.sidebar.markdown("v1.0.1 | [Source Code](https://github.com/yourusername/day-trade-helper)")
-
-    # Create tabs for different content areas
-    if 'data' in st.session_state and st.session_state.data is not None:
-        # Fix for 'bool' object has no attribute 'empty'
-        if isinstance(st.session_state.data, bool):
-            st.error("Invalid data format. Please try again.")
-            return
+            # Risk management settings
+            st.subheader("Risk Management")
             
-        # Add Single Day Analysis tab to the UI
-        tabs = st.tabs(["Dashboard", "Signals", "ORB Analysis", "Single Day Analysis", "Position Sizing", "Backtest"])
+            # Account size
+            account_size = st.number_input("Account Size ($)", value=10000.0, step=1000.0, min_value=1000.0)
+            
+            # Risk per trade
+            risk_per_trade = st.slider("Risk per Trade (%)", 0.5, 5.0, 1.0, 0.1,
+                                     help="Maximum percentage of account to risk on a single trade")
+            
+            # Save risk settings
+            st.session_state.account_size = account_size
+            st.session_state.risk_per_trade = risk_per_trade
+    
+    # Main content area
+    if 'data' not in st.session_state or st.session_state.data is None:
+        # Show welcome screen if no data is loaded
+        st.title("Welcome to Day Trading Helper")
+        st.write("Please select a data source and fetch some data to begin.")
         
-        # Tab 1: Dashboard - Consolidated view, no duplicate subsections
+        # Show a hero image or illustration
+        st.image("https://static.vecteezy.com/system/resources/previews/001/879/536/original/stock-market-forex-trading-graph-free-vector.jpg", use_column_width=True)
+        
+        # Display some sample capabilities
+        st.markdown("""
+        ## Features
+        
+        * 📊 **Technical Analysis** - Generate trading signals using multiple indicators
+        * 📈 **Real-time Data** - Fetch market data from Yahoo Finance
+        * 🔮 **Signal Generation** - Get buy/sell signals with confidence levels
+        * 📉 **Risk Management** - Calculate position sizing and risk metrics
+        * 📱 **Mobile Friendly** - Use on any device with a web browser
+        
+        ## Getting Started
+        
+        1. Select a data source in the sidebar
+        2. Enter a symbol (e.g., AAPL, MSFT, SPY)
+        3. Choose timeframe and period
+        4. Click "Fetch Data" to begin
+        """)
+        
+        # Show a disclaimer
+        with st.expander("Disclaimer"):
+            st.warning("""
+            The information provided by this application is for informational and educational purposes only. 
+            It is not intended to be and does not constitute financial advice or any other advice. 
+            You should not make any decision, financial, investment, trading or otherwise, based on any 
+            of the information presented without undertaking independent due diligence and consultation 
+            with a professional financial advisor.
+            """)
+    else:
+        # Display the selected symbol and timeframe in the title
+        st.title(f"{st.session_state.symbol} Analysis ({st.session_state.timeframe})")
+        
+        # Create tabs for different analysis views
+        tabs = st.tabs(["Chart View", "Signals Analysis", "ORB Analysis"])
+        
+        # Tab 1: Chart View
         with tabs[0]:
-            st.header("Trading Dashboard")
+            st.header("Price Chart")
             
-            # Main metrics and overview
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                # Current price and change
-                latest_price = st.session_state.data['close'].iloc[-1]
-                prev_price = st.session_state.data['close'].iloc[-2] if len(st.session_state.data) > 1 else latest_price
-                price_change = latest_price - prev_price
-                percent_change = (price_change / prev_price) * 100 if prev_price > 0 else 0
-                st.metric(
-                    f"{st.session_state.symbol} Price", 
-                    f"${latest_price:.2f}", 
-                    f"{percent_change:.2f}%"
-                )
+            # Add data source note
+            if hasattr(st.session_state, 'data_source_type'):
+                if "Sample" in st.session_state.data_source_type:
+                    st.error("⚠️ **USING SAMPLE DATA** ⚠️  \nNote that the analysis below is based on sample data, not real market data.", icon="⚠️")
+                elif hasattr(st.session_state, 'data_source_type') and "Yahoo" in st.session_state.data_source_type:
+                    st.success("✅ **USING YAHOO FINANCE DATA** ✅  \nTrading signals and prices are based on Yahoo Finance market data.", icon="✅")
             
-            with col2:
-                # Volume
-                latest_volume = st.session_state.data['volume'].iloc[-1]
-                avg_volume = st.session_state.data['volume'].mean()
-                volume_ratio = (latest_volume / avg_volume) - 1 if avg_volume > 0 else 0
-                st.metric(
-                    "Volume", 
-                    f"{int(latest_volume):,}", 
-                    f"{volume_ratio:.2f}%"
-                )
-            
-            with col3:
-                # Price range
-                day_high = st.session_state.data['high'].iloc[-1]
-                day_low = st.session_state.data['low'].iloc[-1]
-                st.metric("Day Range", f"${day_low:.2f} - ${day_high:.2f}")
-            
-            # Brief signal summary
-            try:
-                signals = generate_signals(st.session_state.data)
-                if signals is not None and not isinstance(signals, bool):
-                    # Check if signals DataFrame is not empty before accessing the last row
-                    latest_signal = signals.iloc[-1] if not signals.empty else None
-                    if latest_signal is not None:
-                        signal_col1, signal_col2 = st.columns(2)
-                        with signal_col1:
-                            if latest_signal.get('buy_signal', False):
-                                st.success("🔼 BUY SIGNAL")
-                            elif latest_signal.get('sell_signal', False):
-                                st.error("🔽 SELL SIGNAL")
-                            else:
-                                st.info("➡️ NEUTRAL")
-                                
-                        with signal_col2:
-                            # Display signal strength if available
-                            if 'signal_strength' in latest_signal:
-                                strength = int(latest_signal['signal_strength'])
-                                labels = {1: "Weak", 2: "Moderate", 3: "Strong", 4: "Very Strong"}
-                                st.info(f"Signal Strength: {labels.get(strength, 'Unknown')}")
-            except Exception as e:
-                st.warning(f"Could not generate signals: {str(e)}")
-        
-        # Tab 2: Signals
-        with tabs[1]:
-            # Generate signals if they don't exist
-            if 'signals' not in st.session_state or st.session_state.signals is None:
+            # Display basic statistics of the data
+            with st.expander("Data Statistics", expanded=False):
                 try:
-                    # Apply market hours filter if selected
-                    data_for_signals = st.session_state.data
+                    # Calculate basic statistics
+                    data = st.session_state.data
+                    stats = pd.DataFrame({
+                        'Open': [data['open'].min(), data['open'].max(), data['open'].mean(), data['open'].std()],
+                        'High': [data['high'].min(), data['high'].max(), data['high'].mean(), data['high'].std()],
+                        'Low': [data['low'].min(), data['low'].max(), data['low'].mean(), data['low'].std()],
+                        'Close': [data['close'].min(), data['close'].max(), data['close'].mean(), data['close'].std()],
+                        'Volume': [data['volume'].min(), data['volume'].max(), data['volume'].mean(), data['volume'].std()]
+                    }, index=['Min', 'Max', 'Mean', 'Std'])
                     
-                    # Check if market hours filter is enabled
-                    if market_hours_filter:
-                        # Get only market hours data using the is_market_hours function
-                        from app.signals.generator import is_market_hours
-                        market_hours_mask = [is_market_hours(idx) for idx in data_for_signals.index]
-                        data_for_signals = data_for_signals.iloc[market_hours_mask]
-                        st.info(f"Filtered data to market hours only: {len(data_for_signals)} data points")
+                    st.dataframe(stats, use_container_width=True)
                     
-                    st.session_state.signals = generate_signals(data_for_signals)
-                    # Store the filter status and count in session state
-                    st.session_state.market_hours_filter_active = market_hours_filter
-                    st.session_state.filtered_data_count = len(data_for_signals)
-                    st.session_state.original_data_count = len(st.session_state.data)
+                    # Calculate price change statistics
+                    if len(data) >= 2:
+                        first_price = data['close'].iloc[0]
+                        last_price = data['close'].iloc[-1]
+                        price_change = last_price - first_price
+                        pct_change = (price_change / first_price) * 100
+                        
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            st.metric("Price Change", f"${price_change:.2f}", f"{pct_change:.2f}%")
+                        with col2:
+                            # Calculate daily volatility
+                            daily_returns = data['close'].pct_change()
+                            volatility = daily_returns.std() * 100
+                            st.metric("Volatility", f"{volatility:.2f}%")
+                        with col3:
+                            # Calculate volume change
+                            first_volume = data['volume'].iloc[0]
+                            last_volume = data['volume'].iloc[-1]
+                            volume_change = ((last_volume / first_volume) - 1) * 100 if first_volume > 0 else 0
+                            st.metric("Volume Change", f"{volume_change:.2f}%")
                 except Exception as e:
-                    st.error(f"Error generating signals: {str(e)}")
-                    st.session_state.signals = None
+                    st.error(f"Error calculating statistics: {str(e)}")
             
-            if 'signals' in st.session_state and st.session_state.signals is not None:
-                # Display market hours filter status
-                if hasattr(st.session_state, 'market_hours_filter_active') and st.session_state.market_hours_filter_active:
-                    filtered_count = getattr(st.session_state, 'filtered_data_count', 0)
-                    original_count = getattr(st.session_state, 'original_data_count', 0)
-                    percent_kept = (filtered_count / original_count * 100) if original_count > 0 else 0
-                    st.info(f"🕙 Market hours filter is active: Using {filtered_count} of {original_count} data points ({percent_kept:.1f}%)")
+            # Display candlestick chart
+            try:
+                # Create figure with secondary y-axis
+                fig = make_subplots(specs=[[{"secondary_y": True}]])
                 
+                # Add candlestick chart
+                fig.add_trace(
+                    go.Candlestick(
+                        x=st.session_state.data.index,
+                        open=st.session_state.data['open'],
+                        high=st.session_state.data['high'],
+                        low=st.session_state.data['low'],
+                        close=st.session_state.data['close'],
+                        name="Price"
+                    )
+                )
+                
+                # Add volume as bar chart on secondary axis
+                fig.add_trace(
+                    go.Bar(
+                        x=st.session_state.data.index,
+                        y=st.session_state.data['volume'],
+                        name="Volume",
+                        marker=dict(color='rgba(100, 100, 255, 0.3)'),
+                        opacity=0.3
+                    ),
+                    secondary_y=True
+                )
+                
+                # Add moving averages
+                ma_periods = [9, 20, 50, 200]
+                ma_colors = ['blue', 'green', 'red', 'purple']
+                
+                for i, period in enumerate(ma_periods):
+                    if len(st.session_state.data) >= period:
+                        ma = st.session_state.data['close'].rolling(window=period).mean()
+                        fig.add_trace(
+                            go.Scatter(
+                                x=st.session_state.data.index,
+                                y=ma,
+                                name=f"{period}-MA",
+                                line=dict(color=ma_colors[i], width=1)
+                            )
+                        )
+                
+                # Update layout
+                fig.update_layout(
+                    title=f"{st.session_state.symbol} Price Chart",
+                    xaxis_title="Date",
+                    yaxis_title="Price",
+                    xaxis_rangeslider_visible=False,
+                    height=600,
+                    legend=dict(
+                        orientation="h",
+                        yanchor="bottom",
+                        y=1.02,
+                        xanchor="right",
+                        x=1
+                    )
+                )
+                
+                # Update y-axes titles
+                fig.update_yaxes(title_text="Price", secondary_y=False)
+                fig.update_yaxes(title_text="Volume", secondary_y=True)
+                
+                st.plotly_chart(fig, use_container_width=True)
+            except Exception as e:
+                st.error(f"Error rendering chart: {str(e)}")
+                traceback.print_exc()
+
+        # Tab 2: Signals Analysis
+        with tabs[1]:
+            st.header("DEBUG: Checking signal analysis tab")
+            try:
+                # Generate signals if not already done
+                if 'signals' not in st.session_state or st.session_state.signals is None:
+                    with st.spinner("Generating signals..."):
+                        st.write("Generating signals...")
+                        from app.signals.generator import generate_signals
+                        signals = generate_signals(st.session_state.data)
+                        st.session_state.signals = signals
+                        st.write(f"Generated {len(signals)} signal entries")
+                
+                # Display a complete table of all signals first
+                st.subheader("All Signals Table")
+                
+                # Create a dataframe with all buy and sell signals
+                all_signals_data = []
+                for idx, row in st.session_state.signals.iterrows():
+                    if row.get('buy_signal', False) or row.get('sell_signal', False):
+                        signal_type = "Buy" if row.get('buy_signal', False) else "Sell"
+                        price = st.session_state.data.loc[idx, 'close'] if idx in st.session_state.data.index else row.get('signal_price', 0)
+                        
+                        # Format timestamp
+                        if hasattr(idx, 'tzinfo'):
+                            try:
+                                # Convert to Eastern time if it's timezone-aware
+                                eastern = pytz.timezone('US/Eastern')
+                                date = idx.astimezone(eastern).strftime('%Y-%m-%d %H:%M:%S ET')
+                            except:
+                                date = str(idx)
+                        else:
+                            date = str(idx)
+                        
+                        # Get details about the signal
+                        details = []
+                        for col in row.index:
+                            if col.endswith('_bullish') or col.endswith('_bearish') or col.startswith('price_') or 'cross' in col:
+                                if row[col]:
+                                    details.append(col.replace('_', ' '))
+                        
+                        # Extract strength from score
+                        score = row.get('buy_score', 0) if signal_type == "Buy" else row.get('sell_score', 0)
+                        
+                        all_signals_data.append({
+                            "Date": date,
+                            "Signal": signal_type,
+                            "Price": f"${price:.2f}" if isinstance(price, (int, float)) else "N/A",
+                            "Score": f"{score:.2f}" if score else "N/A",
+                            "Details": ", ".join(details[:3]) # Limit to first 3 for clarity
+                        })
+                
+                if all_signals_data:
+                    signals_df = pd.DataFrame(all_signals_data)
+                    
+                    # Style the dataframe
+                    def highlight_signals(row):
+                        if row['Signal'] == 'Buy':
+                            return ['background-color: #d4f7d4'] * len(row)
+                        elif row['Signal'] == 'Sell':
+                            return ['background-color: #f7d4d4'] * len(row)
+                        return [''] * len(row)
+                    
+                    st.dataframe(
+                        signals_df.style.apply(highlight_signals, axis=1),
+                        use_container_width=True
+                    )
+                else:
+                    st.warning("No buy or sell signals found in the data")
+                
+                # Now render signal visualization
+                st.write("About to render signals...")
+                from app.components.signals import render_signals
                 render_signals(st.session_state.data, st.session_state.signals, st.session_state.symbol)
-                st.subheader("Advanced Signal Analysis")
-                render_advanced_signals(st.session_state.data, st.session_state.signals, st.session_state.symbol)
-            else:
-                st.warning("No signal data available")
+                st.write("Signals should be rendered above this line")
+            except Exception as e:
+                st.error(f"Error in signals tab: {str(e)}")
+                import traceback
+                st.code(traceback.format_exc())
         
         # Tab 3: ORB Analysis
         with tabs[2]:
-            st.header("Opening Range Breakout (ORB) Analysis")
-            # Generate signals if they don't exist
-            if 'signals' not in st.session_state or st.session_state.signals is None:
-                try:
-                    # Apply market hours filter if selected
-                    data_for_signals = st.session_state.data
-                    
-                    # Check if market hours filter is enabled
-                    if market_hours_filter:
-                        # Get only market hours data using the is_market_hours function
-                        from app.signals.generator import is_market_hours
-                        market_hours_mask = [is_market_hours(idx) for idx in data_for_signals.index]
-                        data_for_signals = data_for_signals.iloc[market_hours_mask]
-                        
-                        # Store the filter status and count in session state
-                        st.session_state.market_hours_filter_active = market_hours_filter
-                        st.session_state.filtered_data_count = len(data_for_signals)
-                        st.session_state.original_data_count = len(st.session_state.data)
-                    
-                    st.session_state.signals = generate_signals(data_for_signals)
-                except Exception as e:
-                    st.error(f"Error generating signals: {str(e)}")
-                    st.session_state.signals = None
-            
-            if 'signals' in st.session_state and st.session_state.signals is not None:
-                # Display market hours filter status
-                if hasattr(st.session_state, 'market_hours_filter_active') and st.session_state.market_hours_filter_active:
-                    filtered_count = getattr(st.session_state, 'filtered_data_count', 0)
-                    original_count = getattr(st.session_state, 'original_data_count', 0)
-                    percent_kept = (filtered_count / original_count * 100) if original_count > 0 else 0
-                    st.info(f"🕙 Market hours filter is active: Using {filtered_count} of {original_count} data points ({percent_kept:.1f}%)")
-                
-                render_orb_signals(st.session_state.data, st.session_state.signals, st.session_state.symbol)
-                
-                # Show explanation of ORB strategy
-                with st.expander("About Opening Range Breakout (ORB) Strategy"):
-                    st.write("""
-                    The Opening Range Breakout (ORB) is a popular day trading strategy that focuses on the price action during the first few minutes after market open.
-                    
-                    **Key Concepts:**
-                    - The opening range is defined as the high and low prices during the first 5-15 minutes of trading.
-                    - A breakout occurs when price moves above the high (bullish) or below the low (bearish) of the opening range.
-                    - These breakouts often signal the direction of the day's trend.
-                    
-                    **Trading Rules:**
-                    - **Buy Signal:** When price breaks above the opening range high
-                    - **Sell Signal:** When price breaks below the opening range low
-                    - **Stop Loss:** Typically placed on the opposite side of the opening range
-                    - **Target:** 1.5 to 2 times the size of the opening range
-                    
-                    This strategy works best on volatile stocks with sufficient volume during the opening minutes.
-                    """)
-            else:
-                st.warning("No signal data available")
-        
-        # Tab 4: Single Day Analysis (NEW)
-        with tabs[3]:
-            st.header(f"Single Day Analysis: {st.session_state.symbol}")
-            
-            # Run single day analysis
+            st.header("DEBUG: Checking ORB analysis tab")
             try:
-                # Import analyze_single_day function
-                from app.signals.generator import analyze_single_day
-                
-                # Filter data to most recent day if not already filtered
-                data_for_analysis = st.session_state.data
-                
-                # Run analysis and display results
-                with st.spinner("Analyzing single day data..."):
-                    results = analyze_single_day(data_for_analysis, st.session_state.symbol)
-                
-                if results["success"]:
-                    # Display basic stats
-                    analysis_data = results["data"]
-                    
-                    # Create summary section
-                    st.subheader("Session Summary")
-                    cols = st.columns(3)
-                    
-                    # Session data metrics
-                    if "session_data" in analysis_data:
-                        session_data = analysis_data["session_data"]
-                        
-                        # Regular hours session
-                        if "regular_hours" in session_data:
-                            reg_hours = session_data["regular_hours"]
-                            with cols[0]:
-                                st.metric("Regular Hours Range", 
-                                          f"${reg_hours.get('low', 0):.2f} - ${reg_hours.get('high', 0):.2f}" if reg_hours else "N/A")
-                                
-                        # Pre-market session
-                        if "pre_market" in session_data:
-                            pre_market = session_data["pre_market"]
-                            with cols[1]:
-                                if pre_market and 'close' in pre_market and 'open' in pre_market:
-                                    change = pre_market['close'] - pre_market['open']
-                                    st.metric("Pre-Market", 
-                                             f"${pre_market.get('close', 0):.2f}", 
-                                             f"{change:.2f}" if change else None)
-                                else:
-                                    st.metric("Pre-Market", "N/A")
-                                    
-                        # Last price info
-                        with cols[2]:
-                            last_close = analysis_data.get("last_close")
-                            if last_close:
-                                st.metric("Last Close", f"${last_close:.2f}")
-                    
-                    # Opening range information
-                    st.subheader("Opening Range")
-                    if "opening_range" in analysis_data:
-                        or_data = analysis_data["opening_range"]
-                        or_cols = st.columns(3)
-                        
-                        with or_cols[0]:
-                            st.metric("ORB High", f"${or_data.get('high', 0):.2f}")
-                        with or_cols[1]:
-                            st.metric("ORB Low", f"${or_data.get('low', 0):.2f}")
-                        with or_cols[2]:
-                            range_size = or_data.get('high', 0) - or_data.get('low', 0)
-                            st.metric("Range Size", f"${range_size:.2f}")
-                    
-                    # Signal information
-                    st.subheader("Trading Signals")
-                    if "signal_rows" in analysis_data and not analysis_data["signal_rows"].empty:
-                        signal_rows = analysis_data["signal_rows"]
-                        
-                        # Display signal metrics
-                        buy_signals = signal_rows['buy_signal'].sum()
-                        sell_signals = signal_rows['sell_signal'].sum()
-                        signal_cols = st.columns(2)
-                        
-                        with signal_cols[0]:
-                            st.metric("Buy Signals", f"{buy_signals}")
-                        with signal_cols[1]:
-                            st.metric("Sell Signals", f"{sell_signals}")
-                        
-                        # Show signals table
-                        if not signal_rows.empty:
-                            st.write("Signal Details:")
-                            
-                            # Create a clean display table
-                            display_df = signal_rows.copy()
-                            
-                            if 'signal_time' in display_df.columns:
-                                display_df['time'] = display_df['signal_time'].dt.strftime('%H:%M:%S')
-                            
-                            # Calculate the signal type
-                            def get_signal_type(row):
-                                if row['buy_signal']:
-                                    return "BUY"
-                                elif row['sell_signal']:
-                                    return "SELL"
-                                else:
-                                    return "NEUTRAL"
-                                
-                            display_df['signal'] = display_df.apply(get_signal_type, axis=1)
-                            
-                            # Calculate R:R ratio
-                            def calculate_rr(row):
-                                if row['buy_signal'] and row['signal_price'] > 0 and row['target_price'] > 0 and row['stop_loss'] > 0:
-                                    risk = row['signal_price'] - row['stop_loss']
-                                    reward = row['target_price'] - row['signal_price']
-                                    if risk > 0:
-                                        return reward / risk
-                                elif row['sell_signal'] and row['signal_price'] > 0 and row['target_price'] > 0 and row['stop_loss'] > 0:
-                                    risk = row['stop_loss'] - row['signal_price']
-                                    reward = row['signal_price'] - row['target_price']
-                                    if risk > 0:
-                                        return reward / risk
-                                return None
-                            
-                            display_df['r_r_ratio'] = display_df.apply(calculate_rr, axis=1)
-                            
-                            # Select and rename columns for display
-                            display_columns = ['time', 'signal', 'signal_price', 'target_price', 'stop_loss', 'r_r_ratio', 'signal_strength']
-                            display_columns = [col for col in display_columns if col in display_df.columns]
-                            
-                            # Display the table
-                            st.dataframe(display_df[display_columns], use_container_width=True)
-                            
-                            # Plot signals on a chart
-                            st.subheader("Signal Chart")
-                            import plotly.graph_objects as go
-                            
-                            fig = go.Figure()
-                            
-                            # Add candlesticks
-                            fig.add_trace(go.Candlestick(
-                                x=data_for_analysis.index,
-                                open=data_for_analysis['open'],
-                                high=data_for_analysis['high'],
-                                low=data_for_analysis['low'],
-                                close=data_for_analysis['close'],
-                                name='Price'
-                            ))
-                            
-                            # Add buy signals
-                            buy_points = signal_rows[signal_rows['buy_signal']]
-                            if not buy_points.empty:
-                                fig.add_trace(go.Scatter(
-                                    x=buy_points.index,
-                                    y=buy_points['signal_price'],
-                                    mode='markers',
-                                    marker=dict(color='green', size=12, symbol='triangle-up'),
-                                    name='Buy Signal'
-                                ))
-                                
-                            # Add sell signals
-                            sell_points = signal_rows[signal_rows['sell_signal']]
-                            if not sell_points.empty:
-                                fig.add_trace(go.Scatter(
-                                    x=sell_points.index,
-                                    y=sell_points['signal_price'],
-                                    mode='markers',
-                                    marker=dict(color='red', size=12, symbol='triangle-down'),
-                                    name='Sell Signal'
-                                ))
-                            
-                            # Update layout
-                            fig.update_layout(
-                                title=f'{st.session_state.symbol} Single Day Analysis',
-                                yaxis_title='Price',
-                                xaxis_title='Time',
-                                xaxis_rangeslider_visible=False,
-                                height=600
-                            )
-                            
-                            st.plotly_chart(fig, use_container_width=True)
-                            
-                    else:
-                        st.info("No signals detected for this time period")
-                    
-                    # Show full day data if requested
-                    if "signals" in analysis_data:
-                        with st.expander("Show All Data Points"):
-                            st.dataframe(analysis_data["signals"], use_container_width=True)
-                    
+                # Ensure we have signals
+                if 'signals' not in st.session_state or st.session_state.signals is None:
+                    st.write("No signals available for ORB analysis")
                 else:
-                    st.error(f"Analysis failed: {results.get('error', 'Unknown error')}")
-                    
+                    st.write("About to render ORB signals...")
+                    from app.components.signals import render_orb_signals
+                    render_orb_signals(st.session_state.data, st.session_state.signals, st.session_state.symbol)
+                    st.write("ORB signals should be rendered above this line")
             except Exception as e:
-                st.error(f"Error in single day analysis: {str(e)}")
+                st.error(f"Error in ORB analysis tab: {str(e)}")
                 import traceback
-                st.exception(e)
-        
-        # Tab 5: Position Sizing
-        with tabs[4]:
-            # Risk management calculator
-            render_risk_calculator(
-                st.session_state.data.iloc[-1]['close'],
-                risk_per_trade,
-                stop_loss_atr,
-                take_profit_ratio
-            )
-        
-        # Tab 6: Backtest
-        with tabs[5]:
-            # Backtesting functionality - use a wrapper to provide a temporary UI
-            st.header("Backtesting")
-            st.info("Choose a strategy and timeframe to backtest your trading signals.")
-            
-            # Instead of using the removed function, create a basic placeholder
-            strategy_options = ["Moving Average Crossover", "RSI Oscillator", "MACD Signal", "Multi-Indicator"]
-            selected_strategy = st.selectbox("Select Strategy", strategy_options)
-            
-            period = st.selectbox("Backtest Period", ["1 Month", "3 Months", "6 Months", "1 Year"])
-            
-            if st.button("Run Backtest"):
-                st.info("Backtesting functionality is under development. Coming soon!")
-                
-                # Use the available render_backtest function if it's implemented
-                try:
-                    render_backtest(st.session_state.data, selected_strategy, st.session_state.symbol)
-                except Exception as e:
-                    st.error(f"Backtest error: {str(e)}")
-                    st.info("Detailed backtesting functionality will be available in a future update.")
-            
-            # Display a sample metrics card
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                st.metric("Win Rate", "0%")
-            with col2:
-                st.metric("Profit Factor", "0.0")
-            with col3:
-                st.metric("Max Drawdown", "0%")
-            with col4:
-                st.metric("Net Profit", "$0")
-    else:
-        # Landing page content when no data is loaded
-        st.write("# Welcome to Day Trading Helper!")
-        st.write("👈 Configure your settings in the sidebar and click 'Fetch Data' to get started.")
-        
-        # Create empty tabs for navigation consistency
-        tabs = st.tabs(["Dashboard", "Signals", "Position Sizing", "Backtest"])
+                st.code(traceback.format_exc())
 
 if __name__ == "__main__":
     try:
