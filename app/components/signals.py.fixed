@@ -1,0 +1,1 @@
+    signal_df = pd.DataFrame(signal_data)

@@ -1,3 +1,5 @@
+import ibkr_runtime_patch  # Applied by fix_main_app.py to fix IBKR API parameter incompatibility
+
 import os
 import pandas as pd
 import numpy as np
@@ -11,27 +13,83 @@ import pytz
 import warnings
 import traceback
 from pathlib import Path
+import asyncio
+import nest_asyncio
+import logging
+from threading import Thread
 
-# Import helper modules
-from app.signals.generator import (
-    generate_signals,
-    generate_signals_advanced,
-    analyze_single_day,
-    generate_signals_multi_timeframe,
-    is_market_hours
-)
-from app.components.signals import (
+# Create and set event loop before importing any ib_insync modules
+nest_asyncio.apply()
+asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
+
+# Now import ib_insync components
+from ib_insync import util
+util.patchAsyncio()
+
+# Import helper modules directly from their respective files
+from signals.signal_functions import generate_standard_signals as generate_signals
+from signals.signal_functions import is_market_hours
+from signals.generator import analyze_single_day, generate_signals_multi_timeframe
+from signals.paired_signals import PairedSignalGenerator
+
+# Import signal processing functions
+try:
+    from signals.generator import generate_signals_advanced
+except ImportError:
+    # Fallback if there's an import error
+    def generate_signals_advanced(data, **kwargs):
+        warnings.warn("generate_signals_advanced not available, using basic signals")
+        return generate_signals(data)
+
+# Import UI components
+from components.signals import (
     render_signal_table,
     render_signals,
     render_orb_signals,
-    render_advanced_signals
+    render_advanced_signals,
+    render_exit_strategy_analysis
 )
-from app.data.loader import (
+
+# Import data functions
+from data.loader import (
     load_sample_data
 )
 
+# Import IBKR client and real-time streaming components
+try:
+    # When imported as a module
+    from app.ibkr_client import IBKRClient
+    from app.streamlit_ibkr import render_ibkr_data_page, init_ibkr_client
+    from app.asyncio_patch import ensure_event_loop, with_event_loop, run_periodically, background_loop
+    IBKR_AVAILABLE = True
+    print("IBKR components successfully imported, IBKR_AVAILABLE =", IBKR_AVAILABLE)
+except ImportError:
+    try:
+        # When run directly
+        from ibkr_client import IBKRClient  
+        from streamlit_ibkr import render_ibkr_data_page, init_ibkr_client
+        from asyncio_patch import ensure_event_loop, with_event_loop, run_periodically, background_loop
+        IBKR_AVAILABLE = True
+        print("IBKR components successfully imported (direct), IBKR_AVAILABLE =", IBKR_AVAILABLE)
+    except ImportError as e:
+        print(f"IBKR components not available: {e}")
+        IBKR_AVAILABLE = False
+
 # Suppress warnings
 warnings.filterwarnings('ignore')
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Initialize background task flag
+if 'background_task_running' not in st.session_state:
+    st.session_state.background_task_running = False
 
 # Set page config
 st.set_page_config(
@@ -47,28 +105,13 @@ if 'data' not in st.session_state:
 if 'signals' not in st.session_state:
     st.session_state.signals = None
 if 'symbol' not in st.session_state:
-    st.session_state.symbol = 'AAPL'
+    st.session_state.symbol = 'SPY'
 if 'exchange' not in st.session_state:
     st.session_state.exchange = 'NASDAQ'
-
-def configure_api_keys():
-    """Configure API keys for various data providers"""
-    st.title("Day Trading Helper")
-    st.header("API Key Configuration")
-    
-    st.write("""
-    ### No API Keys Required
-    
-    This application now uses Yahoo Finance data, which doesn't require API keys.
-    
-    Simply click the 'Continue to App' button below to start using the application.
-    """)
-    
-    if st.button("Continue to App", use_container_width=True):
-        # Store a flag in the session to skip this page next time
+if 'api_keys_configured' not in st.session_state:
         st.session_state.api_keys_configured = True
-        # Rerun the script to refresh
-        st.experimental_rerun()
+if 'active_page' not in st.session_state:
+    st.session_state.active_page = "main"
 
 def init_data_client():
     """Initialize data client - in this case, we use Yahoo Finance which requires no authentication"""
@@ -432,12 +475,172 @@ def fetch_yahoo_data(symbol, period='1d', interval='1m'):
         st.error(f"Error fetching data from Yahoo Finance: {str(e)}")
         return None
 
+@run_periodically("ibkr_data_processor", interval=1.0)
+def process_ibkr_data():
+    """
+    Process IBKR data in the background without using Streamlit context
+    
+    This runs in a background thread and just handles the IB event loop
+    without trying to access Streamlit's session_state
+    """
+    try:
+        # Check if we have an IB instance in our global variable
+        global ibkr_client
+        
+        if ibkr_client is not None:
+            # Run one iteration of the event loop
+            ibkr_client.run_one_iteration()
+            
+            # Check if we should reconnect
+            if not ibkr_client.connected:
+                logger.info("IB disconnected, attempting to reconnect")
+                try:
+                    ibkr_client.connect()
+                except Exception as e:
+                    logger.error(f"Failed to reconnect to IB: {str(e)}")
+    except Exception as e:
+        logger.error(f"Error in process_ibkr_data: {str(e)}")
+
+# Create a global var to avoid session_state access
+ibkr_client = None
+
+def start_background_tasks():
+    """Start background tasks to handle IB data streaming"""
+    global ibkr_client
+    
+    if 'background_task_running' not in st.session_state:
+        st.session_state.background_task_running = False
+        
+    if not st.session_state.background_task_running:
+        # Initialize client if needed
+        init_ibkr_client()
+        
+        # Set the global client for use in background loops
+        if 'ibkr' in st.session_state:
+            ibkr_client = st.session_state.ibkr
+        
+        # The background loop is already running from asyncio_patch initialization
+        st.session_state.background_task_running = True
+        logger.info("Background tasks started")
+    else:
+        # Update the global client if needed
+        if 'ibkr' in st.session_state:
+            ibkr_client = st.session_state.ibkr
+
+def render_debug_panel():
+    """Render a debug panel to monitor the application state"""
+    if st.sidebar.checkbox("Debug Mode", value=st.session_state.get("debug_mode", False)):
+        st.session_state.debug_mode = True
+        
+        # Create a container for debug info
+        debug_container = st.sidebar.container()
+        
+        with debug_container:
+            st.write("### Debug Information")
+            
+            # Connection status
+            if 'ibkr' in st.session_state:
+                st.write("IB Connection Status:", st.session_state.ibkr.connected)
+            
+            # Market data types
+            if 'market_data_types' in st.session_state:
+                st.write("Market Data Types:", st.session_state.market_data_types)
+            
+            # Active streams
+            if 'ibkr' in st.session_state and hasattr(st.session_state.ibkr, 'data_streams'):
+                st.write("Active Streams:", list(st.session_state.ibkr.data_streams.keys()))
+            
+            # Session state data
+            data_keys = [k for k in st.session_state.keys() if k.endswith('_data')]
+            if data_keys:
+                with st.expander("Raw Data in Session State"):
+                    for k in data_keys:
+                        st.write(f"{k}:", st.session_state[k])
+            
+            # Time offsets
+            if 'ibkr' in st.session_state and hasattr(st.session_state.ibkr, 'time_offset'):
+                st.write("Time Offset:", f"{st.session_state.ibkr.time_offset:.2f} seconds")
+            
+            # Last update time
+            if 'last_ui_update' in st.session_state:
+                st.write("Last UI Update:", time.time() - st.session_state.last_ui_update, "seconds ago")
+    else:
+        st.session_state.debug_mode = False
+
+def setup_event_loop():
+    """Set up the event loop properly for Streamlit."""
+    try:
+        logger.info("Setting up event loop for Streamlit")
+        # Apply nest_asyncio to make asyncio work in Streamlit
+        nest_asyncio.apply()
+        
+        # Create a new event loop if there isn't one already
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_closed():
+                logger.warning("Event loop was closed. Creating a new one.")
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+        except RuntimeError:
+            logger.info("No event loop in current thread. Creating a new one.")
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        
+        # Patch asyncio to work better with Streamlit
+        util.patchAsyncio()
+        
+        logger.info(f"Event loop setup complete: {loop}")
+        return loop
+    except Exception as e:
+        logger.error(f"Error setting up event loop: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
+
+def ensure_ibkr_available():
+    """Ensure IBKR components are available and update the global variable"""
+    global IBKR_AVAILABLE
+    try:
+        # Try importing the components
+        from ibkr_client import IBKRClient
+        from streamlit_ibkr import init_ibkr_client, render_ibkr_data_page, add_ibkr_to_main_app
+        IBKR_AVAILABLE = True
+        logger.info("IBKR components available: %s", IBKR_AVAILABLE)
+        return True
+    except ImportError as e:
+        IBKR_AVAILABLE = False
+        logger.error("IBKR components not available: %s", str(e))
+        return False
+
 def main():
     """Main function to run the Day Trading Helper application"""
     
-    # Check if API key configuration should be shown
-    if not st.session_state.get('api_keys_configured', False):
-        configure_api_keys()
+    # Ensure we have a valid event loop
+    loop = asyncio.get_event_loop()
+    
+    # Make sure IBKR availability is checked
+    ensure_ibkr_available()
+    
+    # Print IBKR status for debugging
+    print("In main function, IBKR_AVAILABLE =", IBKR_AVAILABLE)
+    
+    # Start background tasks for IB data handling
+    try:
+        if IBKR_AVAILABLE:
+            start_background_tasks()
+    except Exception as e:
+        logger.error(f"Error starting background tasks: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    # Check if we should display the real-time dashboard
+    if st.session_state.active_page == "real_time":
+        if IBKR_AVAILABLE:
+            render_ibkr_data_page()
+            return
+        else:
+            st.error("Real-time trading is not available. Please install ib_insync and nest_asyncio packages.")
+            st.session_state.active_page = "main"
         return
     
     # Create a sidebar for configuration options
@@ -459,32 +662,49 @@ def main():
         
         with config_tabs[0]:
             # Data source selection
+            # Check IBKR availability again
+            ensure_ibkr_available()
+            
+            data_source_options = ["Yahoo Finance", "Sample Data"]
+            
+            # Add IBKR as a data source if available
+            if IBKR_AVAILABLE:
+                data_source_options.insert(0, "Interactive Brokers")
+                st.success("Interactive Brokers integration is available")
+            else:
+                st.warning("Interactive Brokers integration is not available. Check logs for details.")
+                
             data_source = st.selectbox(
                 "Select Data Source",
-                ["Yahoo Finance", "Sample Data"],
+                data_source_options,
                 index=0
             )
             
-            # Add a note about Yahoo Finance data
-            if data_source == "Yahoo Finance":
+            # Show specific instructions based on data source
+            if data_source == "Interactive Brokers":
+                st.info("📊 **Interactive Brokers:**\n"
+                       "- Real-time market data access\n"
+                       "- Requires TWS or Gateway running\n"
+                       "- Connect via API on port 7497 (TWS) or 4002 (Gateway)", icon="ℹ️")
+            elif data_source == "Yahoo Finance":
                 st.info("📊 **Yahoo Finance:**\n"
                        "- For 1-minute data, only last 7 days available\n"
                        "- No authentication required\n"
                        "- 15+ minute delay for real-time data", icon="ℹ️")
             
-            # Symbol selection
-            symbol = st.text_input("Symbol", "AAPL").upper()
+            # Symbol selection with SPY as default
+            symbol = st.text_input("Symbol", "SPY").upper()
             
-            # Timeframe selection
+            # Timeframe selection with 1m as default
             timeframe = st.selectbox(
                 "Select Timeframe",
                 ["1m", "5m", "15m", "30m", "1h", "4h", "1d"],
-                index=4
+                index=0
             )
             
-            # Period selection
+            # Period selection with 1d as default
             period_options = ["1d", "5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "max"]
-            period = st.selectbox("Select Period", period_options, index=1)
+            period = st.selectbox("Select Period", period_options, index=0)
             
             # Add single day trading mode option
             st.divider()
@@ -514,8 +734,8 @@ def main():
                         # If using SPY mode with SPY symbol, use the SPY config
                         if spy_day_trading_mode and symbol.upper() == "SPY":
                             try:
-                                from app.config import SPY_CONFIG
-                                from app.signals.spy_strategy import analyze_spy_day_trading
+                                from config import SPY_CONFIG
+                                from signals.spy_strategy import analyze_spy_day_trading
                                 st.session_state['config'] = SPY_CONFIG
                                 st.session_state['use_spy_strategy'] = True
                                 st.success(f"Using optimized SPY configuration and strategy")
@@ -529,7 +749,12 @@ def main():
                         st.session_state.using_sample_data = False
                         
                         # Load data based on selected source
-                        if data_source == "Sample Data":
+                        if data_source == "Interactive Brokers" and IBKR_AVAILABLE:
+                            # Set active page to real-time dashboard
+                            st.session_state.active_page = "real_time"
+                            st.session_state.symbol = symbol
+                            st.experimental_rerun()
+                        elif data_source == "Sample Data":
                             st.session_state.data = load_sample_data(symbol, timeframe, period)
                             st.session_state.using_sample_data = True
                             st.session_state.data_source_type = "Sample Data"
@@ -637,7 +862,9 @@ def main():
             st.session_state.risk_per_trade = risk_per_trade
     
     # Main content area
-    if 'data' not in st.session_state or st.session_state.data is None:
+    if st.session_state.active_page == "real_time" and IBKR_AVAILABLE:
+        render_ibkr_data_page()
+    elif 'data' not in st.session_state or st.session_state.data is None:
         # Show welcome screen if no data is loaded
         st.title("Welcome to Day Trading Helper")
         st.write("Please select a data source and fetch some data to begin.")
@@ -650,7 +877,7 @@ def main():
         ## Features
         
         * 📊 **Technical Analysis** - Generate trading signals using multiple indicators
-        * 📈 **Real-time Data** - Fetch market data from Yahoo Finance
+        * 📈 **Real-time Data** - Fetch market data from Yahoo Finance or Interactive Brokers
         * 🔮 **Signal Generation** - Get buy/sell signals with confidence levels
         * 📉 **Risk Management** - Calculate position sizing and risk metrics
         * 📱 **Mobile Friendly** - Use on any device with a web browser
@@ -677,7 +904,7 @@ def main():
         st.title(f"{st.session_state.symbol} Analysis ({st.session_state.timeframe})")
         
         # Create tabs for different analysis views
-        tabs = st.tabs(["Chart View", "Signals Analysis", "ORB Analysis"])
+        tabs = st.tabs(["Chart View", "Signals Analysis", "ORB Analysis", "Exit Strategy"])
         
         # Tab 1: Chart View
         with tabs[0]:
@@ -807,10 +1034,23 @@ def main():
                 if 'signals' not in st.session_state or st.session_state.signals is None:
                     with st.spinner("Generating signals..."):
                         st.write("Generating signals...")
-                        from app.signals.generator import generate_signals
-                        signals = generate_signals(st.session_state.data)
-                        st.session_state.signals = signals
-                        st.write(f"Generated {len(signals)} signal entries")
+                        from signals.generator import generate_signals_with_pairs
+                        
+                        # Generate signals with paired information
+                        paired_results = generate_signals_with_pairs(st.session_state.data)
+                        
+                        # Store signals and paired results in session state
+                        st.session_state.signals = paired_results['signal_df']
+                        st.session_state.paired_results = paired_results
+                        
+                        st.write(f"Generated {len(st.session_state.signals)} signal entries with paired signals")
+                        
+                        # Display info about paired signals if available
+                        if 'paired_signals' in paired_results and not paired_results['paired_signals'].empty:
+                            metrics = paired_results.get('metrics', {})
+                            st.success(f"Found {len(paired_results['paired_signals'])} valid trade pairs with " +
+                                     f"{metrics.get('win_rate', 0)*100:.1f}% win rate and " +
+                                     f"{metrics.get('avg_profit', 0)*100:.2f}% average profit")
                 
                 # Display a complete table of all signals first
                 st.subheader("All Signals Table")
@@ -818,8 +1058,16 @@ def main():
                 # Create a dataframe with all buy and sell signals
                 all_signals_data = []
                 for idx, row in st.session_state.signals.iterrows():
-                    if row.get('buy_signal', False) or row.get('sell_signal', False):
-                        signal_type = "Buy" if row.get('buy_signal', False) else "Sell"
+                    # Check for both raw and filtered signals
+                    has_raw_signal = row.get('buy_signal', False) or row.get('sell_signal', False)
+                    has_filtered_signal = row.get('filtered_buy_signal', False) or row.get('filtered_sell_signal', False)
+                    
+                    if has_raw_signal or has_filtered_signal:
+                        # Determine signal types
+                        raw_signal_type = "Buy" if row.get('buy_signal', False) else "Sell" if row.get('sell_signal', False) else "None"
+                        filtered_signal_type = "Buy" if row.get('filtered_buy_signal', False) else "Sell" if row.get('filtered_sell_signal', False) else "None"
+                        
+                        # Only filtered signals have a price value
                         price = st.session_state.data.loc[idx, 'close'] if idx in st.session_state.data.index else row.get('signal_price', 0)
                         
                         # Format timestamp
@@ -841,25 +1089,84 @@ def main():
                                     details.append(col.replace('_', ' '))
                         
                         # Extract strength from score
-                        score = row.get('buy_score', 0) if signal_type == "Buy" else row.get('sell_score', 0)
+                        raw_score = row.get('buy_score', 0) if raw_signal_type == "Buy" else row.get('sell_score', 0) if raw_signal_type == "Sell" else 0
+                        
+                        # Get ATR value if available
+                        atr_value = st.session_state.data.loc[idx, 'atr'] if idx in st.session_state.data.index and 'atr' in st.session_state.data.columns else None
                         
                         all_signals_data.append({
                             "Date": date,
-                            "Signal": signal_type,
+                            "Raw Signal": raw_signal_type,
+                            "Filtered Signal": filtered_signal_type,
                             "Price": f"${price:.2f}" if isinstance(price, (int, float)) else "N/A",
-                            "Score": f"{score:.2f}" if score else "N/A",
+                            "Score": f"{raw_score:.2f}" if raw_score else "N/A",
+                            "ATR": f"{atr_value:.4f}" if atr_value is not None else "N/A",
                             "Details": ", ".join(details[:3]) # Limit to first 3 for clarity
                         })
                 
                 if all_signals_data:
+                    # Add stats about raw vs filtered signals
+                    st.subheader("ATR-Filtered Signals Stats")
+                    
+                    # Calculate stats
+                    raw_buy_count = (st.session_state.signals['buy_signal'] == True).sum()
+                    raw_sell_count = (st.session_state.signals['sell_signal'] == True).sum()
+                    filtered_buy_count = (st.session_state.signals['filtered_buy_signal'] == True).sum() if 'filtered_buy_signal' in st.session_state.signals.columns else 0
+                    filtered_sell_count = (st.session_state.signals['filtered_sell_signal'] == True).sum() if 'filtered_sell_signal' in st.session_state.signals.columns else 0
+                    
+                    # Display stats in columns
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("Raw Buy Signals", raw_buy_count)
+                        st.metric("Raw Sell Signals", raw_sell_count)
+                    with col2:
+                        st.metric("Filtered Buy Signals", filtered_buy_count)
+                        st.metric("Filtered Sell Signals", filtered_sell_count)
+                    with col3:
+                        reduction_pct_buy = ((raw_buy_count - filtered_buy_count) / raw_buy_count * 100) if raw_buy_count > 0 else 0
+                        reduction_pct_sell = ((raw_sell_count - filtered_sell_count) / raw_sell_count * 100) if raw_sell_count > 0 else 0
+                        st.metric("Noise Reduction (Buy)", f"{reduction_pct_buy:.1f}%")
+                        st.metric("Noise Reduction (Sell)", f"{reduction_pct_sell:.1f}%")
+                    
+                    # Show info about the ATR filter
+                    symbol = st.session_state.symbol
+                    if symbol == 'SPY' and hasattr(st.session_state, 'use_spy_strategy') and st.session_state.use_spy_strategy:
+                        st.info("Using optimized SPY-specific ATR filter settings (k=0.5)")
+                    else:
+                        st.info("Using standard ATR filter settings (k=0.7)")
+                    
+                    # Create the signals dataframe
                     signals_df = pd.DataFrame(all_signals_data)
                     
                     # Style the dataframe
                     def highlight_signals(row):
-                        if row['Signal'] == 'Buy':
-                            return ['background-color: #d4f7d4'] * len(row)
-                        elif row['Signal'] == 'Sell':
-                            return ['background-color: #f7d4d4'] * len(row)
+                        # No signal
+                        if row['Raw Signal'] == 'None' and row['Filtered Signal'] == 'None':
+                            return [''] * len(row)
+                            
+                        # Filter removed a signal (highlight in yellow)
+                        if row['Raw Signal'] != 'None' and row['Filtered Signal'] == 'None':
+                            style = ['background-color: #fff2cc'] * len(row)
+                            return style
+                        
+                        # Raw buy signal
+                        if row['Raw Signal'] == 'Buy':
+                            style = ['background-color: #d4f7d4'] * len(row)
+                            
+                            # If filtered signal is different, highlight it
+                            if row['Filtered Signal'] != 'Buy':
+                                style[2] = 'background-color: #fff2cc; color: #000000'
+                            return style
+                            
+                        # Raw sell signal
+                        if row['Raw Signal'] == 'Sell':
+                            style = ['background-color: #f7d4d4'] * len(row)
+                            
+                            # If filtered signal is different, highlight it
+                            if row['Filtered Signal'] != 'Sell':
+                                style[2] = 'background-color: #fff2cc; color: #000000'
+                            return style
+                            
                         return [''] * len(row)
                     
                     st.dataframe(
@@ -871,8 +1178,19 @@ def main():
                 
                 # Now render signal visualization
                 st.write("About to render signals...")
-                from app.components.signals import render_signals
+                from components.signals import render_signals
                 render_signals(st.session_state.data, st.session_state.signals, st.session_state.symbol)
+                
+                # Add a button to navigate to the Paired Signals page
+                if 'paired_results' in st.session_state and 'paired_signals' in st.session_state.paired_results:
+                    paired_signals = st.session_state.paired_results['paired_signals']
+                    if not paired_signals.empty:
+                        st.info("For more detailed analysis of paired entry-exit signals, visit the Paired Signals page.")
+                        if st.button("Go to Paired Signals Analysis"):
+                            # Set a flag to navigate to the paired signals page
+                            st.session_state.navigate_to_paired_signals = True
+                            st.experimental_rerun()
+                
                 st.write("Signals should be rendered above this line")
             except Exception as e:
                 st.error(f"Error in signals tab: {str(e)}")
@@ -888,11 +1206,25 @@ def main():
                     st.write("No signals available for ORB analysis")
                 else:
                     st.write("About to render ORB signals...")
-                    from app.components.signals import render_orb_signals
+                    from components.signals import render_orb_signals
                     render_orb_signals(st.session_state.data, st.session_state.signals, st.session_state.symbol)
                     st.write("ORB signals should be rendered above this line")
             except Exception as e:
                 st.error(f"Error in ORB analysis tab: {str(e)}")
+                import traceback
+                st.code(traceback.format_exc())
+
+        # Tab 4: Exit Strategy Analysis
+        with tabs[3]:
+            st.header("Exit Strategy Analysis")
+            try:
+                # Ensure we have data
+                if 'data' not in st.session_state or st.session_state.data is None:
+                    st.write("No data available for exit strategy analysis")
+                else:
+                    render_exit_strategy_analysis(st.session_state.data)
+            except Exception as e:
+                st.error(f"Error in exit strategy analysis tab: {str(e)}")
                 import traceback
                 st.code(traceback.format_exc())
 
@@ -902,8 +1234,22 @@ if __name__ == "__main__":
     except ImportError:
         st.error("Missing required package: pytz. Install with 'pip install pytz'")
         st.stop()
+    
+    # Set up proper event loop for Streamlit
+    try:
+        setup_event_loop()
+    except Exception as e:
+        st.error(f"Failed to set up event loop: {str(e)}")
+    
+    # Initialize IBKR client if available
+    if IBKR_AVAILABLE:
+        try:
+            init_ibkr_client()
+        except Exception as e:
+            st.error(f"Error initializing IBKR client: {str(e)}")
         
     try:
         main()
     except Exception as e:
         st.error(f"Application error: {str(e)}") 
+        traceback.print_exc() 

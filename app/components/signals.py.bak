@@ -1,0 +1,2097 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import pytz
+from datetime import datetime, time
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from typing import Dict
+import plotly.express as px
+import traceback
+import matplotlib.pyplot as plt
+
+from app.signals import generate_signals, SignalStrength
+from app.signals.generator import create_default_signal_generator, generate_signals_advanced, analyze_exit_strategy
+from app.signals.timeframes import TimeFrame, TimeFramePriority
+from app.indicators import calculate_opening_range
+
+def is_market_hours(timestamp):
+    """
+    Check if the given timestamp is during market hours (9:30 AM - 4:00 PM ET, Monday-Friday)
+    
+    Args:
+        timestamp: Datetime object or index
+        
+    Returns:
+        bool: True if timestamp is during market hours, False otherwise
+    """
+    # If timestamp has no tzinfo, assume it's UTC and convert
+    if hasattr(timestamp, 'tzinfo'):
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=pytz.UTC)
+        # Convert to Eastern Time
+        eastern = pytz.timezone('US/Eastern')
+        timestamp = timestamp.astimezone(eastern)
+    else:
+        # If not a datetime, just return True (can't determine)
+        return True
+    
+    # Check if it's a weekday (0 = Monday, 4 = Friday)
+    if timestamp.weekday() > 4:  # Saturday or Sunday
+        return False
+        
+    # Check if within 9:30 AM - 4:00 PM ET
+    market_open = time(9, 30, 0)
+    market_close = time(16, 0, 0)
+    
+    return market_open <= timestamp.time() <= market_close
+
+def format_timestamp_as_et(timestamp):
+    """
+    Format timestamp in Eastern Time with appropriate market hours indication
+    
+    Args:
+        timestamp: Datetime object or index
+        
+    Returns:
+        str: Formatted timestamp string in Eastern Time
+    """
+    # Handle None value
+        if timestamp is None:
+        return "N/A"
+        
+        if not hasattr(timestamp, 'tzinfo'):
+        
+        return str(timestamp)
+    
+    # Convert to Eastern Time
+        if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=pytz.UTC)
+        eastern = pytz.timezone('US/Eastern')
+        et_time = timestamp.astimezone(eastern)
+    
+    # Format as string with ET indicator
+    formatted = et_time.strftime('%Y-%m-%d %H:%M ET')
+    
+    # Add market status
+        if is_market_hours(timestamp):
+        return f"{formatted} (Market Open)"
+        else:
+        return f"{formatted} (Market Closed)"
+
+def render_signal_table(data):
+    """
+    Render a table of trading signals with explanations
+    
+    Args:
+        data (pd.DataFrame): DataFrame with price data
+    """
+    # Check if signals exist in session state first
+        if 'signals' not in st.session_state or st.session_state.signals is None:
+        # If not in session state, generate them
+        from app.signals import generate_signals
+        
+        st.header("Trading Signals")
+        
+        # Generate signals from data
+            with st.spinner("Generating signals..."):
+            signals = generate_signals(data)
+            else:
+        # Use existing signals from session state
+        signals = st.session_state.signals
+        st.header("Trading Signals")
+        
+    # Check if we have advanced results available
+    has_advanced = hasattr(st.session_state, 'advanced_results') and st.session_state.advanced_results is not None
+    advanced_results = getattr(st.session_state, 'advanced_results', None) if has_advanced else None
+    
+    # Ensure signal prices match actual data prices for display
+        if 'signal_price' in signals.columns:
+        signal_indices = signals.index
+            for idx in signal_indices:
+                if idx in data.index and 'close' in data.columns:
+                # Update signal price to match actual close price
+                signals.loc[idx, 'signal_price'] = data.loc[idx, 'close']
+    
+    # Display basic information about signals
+    buy_signals_count = signals['buy_signal'].astype(bool).sum() if 'buy_signal' in signals.columns else 0
+    sell_signals_count = signals['sell_signal'].astype(bool).sum() if 'sell_signal' in signals.columns else 0
+    exit_buy_count = signals['exit_buy'].astype(bool).sum() if 'exit_buy' in signals.columns else 0
+    exit_sell_count = signals['exit_sell'].astype(bool).sum() if 'exit_sell' in signals.columns else 0
+    total_signals = buy_signals_count + sell_signals_count + exit_buy_count + exit_sell_count
+    
+        if has_advanced:
+    
+        regime = advanced_results.get('market_regime', 'unknown').replace('_', ' ').title()
+        st.info(f"Found {total_signals} signals ({buy_signals_count} buy, {sell_signals_count} sell, {exit_buy_count} exit long, {exit_sell_count} exit short) - Market Regime: {regime}")
+        else:
+        st.info(f"Found {total_signals} signals ({buy_signals_count} buy, {sell_signals_count} sell, {exit_buy_count} exit long, {exit_sell_count} exit short)")
+    
+    # Import exit strategy analyzer
+    from app.signals.generator import analyze_exit_strategy
+    
+    # Create a list to store signal data
+    signal_data = []
+    entry_exit_pairs = []
+    
+    # Process all signals chronologically
+    # First, extract buy signals
+        if 'buy_signal' in signals.columns:
+        buy_signals = signals[signals['buy_signal'] == True]
+        
+            for idx, row in buy_signals.iterrows():
+            # Format timestamp in Eastern Time
+                if hasattr(idx, 'tzinfo'):
+                    try:
+                    eastern = pytz.timezone('US/Eastern')
+                    date = idx.astimezone(eastern).strftime('%Y-%m-%d %H:%M:%S ET')
+                    except:
+                    date = str(idx)
+                    else:
+                    date = str(idx)
+                    else:
+                date = str(idx)
+            
+            # Get price
+            price = data.loc[idx, 'close'] if idx in data.index else row.get('signal_price', 0)
+                
+            # Add to signal data
+            signal_data.append({
+                "Time": date,
+                "Signal": "Buy",
+                "Price": f"${price:.2f}",
+                "Explanation": "Buy signal generated",
+                "Target": "",
+                "Stop Loss": ""
+            })
+            
+            # [Rest of your existing buy signal processing code...]
+    
+    # Extract sell signals
+        if 'sell_signal' in signals.columns:
+        sell_signals = signals[signals['sell_signal'] == True]
+        
+            for idx, row in sell_signals.iterrows():
+            # Format timestamp in Eastern Time
+                if hasattr(idx, 'tzinfo'):
+                    try:
+                    eastern = pytz.timezone('US/Eastern')
+                    date = idx.astimezone(eastern).strftime('%Y-%m-%d %H:%M:%S ET')
+                    except:
+                    date = str(idx)
+                    else:
+                    date = str(idx)
+                    else:
+                date = str(idx)
+            
+            # Get price
+            price = data.loc[idx, 'close'] if idx in data.index else row.get('signal_price', 0)
+            
+            # Add to signal data
+            signal_data.append({
+                "Time": date,
+                "Signal": "Sell",
+                "Price": f"${price:.2f}",
+                "Explanation": "Sell signal generated",
+                "Target": "",
+                "Stop Loss": ""
+            })
+            
+            # [Rest of your existing sell signal processing code...]
+    
+    # Extract exit buy signals
+        if 'exit_buy' in signals.columns:
+        exit_buy_signals = signals[signals['exit_buy'] == True]
+        
+            for idx, row in exit_buy_signals.iterrows():
+            # Format timestamp in Eastern Time
+                if hasattr(idx, 'tzinfo'):
+                    try:
+                    eastern = pytz.timezone('US/Eastern')
+                    date = idx.astimezone(eastern).strftime('%Y-%m-%d %H:%M:%S ET')
+                    except:
+                    date = str(idx)
+                    else:
+                    date = str(idx)
+            
+            # Get price
+            price = data.loc[idx, 'close'] if idx in data.index else row.get('signal_price', 0)
+            
+            # Get exit reason if available
+            exit_reason = "Momentum/RSI Weakening"
+                if 'exit_reason' in row and row['exit_reason']:
+                exit_reason = row['exit_reason']
+            
+            # Add to signal data
+            signal_data.append({
+                "Time": date,
+                "Signal": "EXIT LONG",
+                "Price": f"${price:.2f}",
+                "Explanation": f"Exit reason: {exit_reason}",
+                "Target": "",
+                "Stop Loss": ""
+            })
+    
+    # Extract exit sell signals
+        if 'exit_sell' in signals.columns:
+        exit_sell_signals = signals[signals['exit_sell'] == True]
+        
+            for idx, row in exit_sell_signals.iterrows():
+            # Format timestamp in Eastern Time
+                if hasattr(idx, 'tzinfo'):
+                    try:
+                    eastern = pytz.timezone('US/Eastern')
+                    date = idx.astimezone(eastern).strftime('%Y-%m-%d %H:%M:%S ET')
+                    except:
+                    date = str(idx)
+                    else:
+                    date = str(idx)
+                    else:
+                date = str(idx)
+            
+            # Get price
+            price = data.loc[idx, 'close'] if idx in data.index else row.get('signal_price', 0)
+            
+            # Get exit reason if available
+            exit_reason = "Momentum/RSI Strengthening"
+                if 'exit_reason' in row and row['exit_reason']:
+                exit_reason = row['exit_reason']
+            
+            # Add to signal data
+            signal_data.append({
+                "Time": date,
+                "Signal": "EXIT SHORT",
+                "Price": f"${price:.2f}",
+                "Explanation": f"Exit reason: {exit_reason}",
+                "Target": "",
+                "Stop Loss": ""
+            })
+    
+    # [Continue with entry-exit pairs processing...]
+    
+    # Sort signal data by time (newest first)
+    signal_data.sort(key=lambda x: x["Time"], reverse=True)
+    
+    # Create the dataframe for display
+    signal_df = pd.DataFrame(signal_data)
+        
+    # Apply styling to highlight different signal types
+def color_signals(val):
+            if val == "Buy":
+            return 'background-color: rgba(0, 255, 0, 0.2)'
+            elif val == "Sell":
+            return 'background-color: rgba(255, 0, 0, 0.2)'
+            elif "EXIT LONG" in str(val):
+            return 'background-color: rgba(100, 100, 255, 0.3)'
+            elif "EXIT SHORT" in str(val):
+            return 'background-color: rgba(255, 165, 0, 0.3)'
+            elif "EXIT" in str(val):
+            return 'background-color: rgba(100, 100, 255, 0.3)'
+        return ''
+    
+    # Display the signal table with styling
+        if 'P&L' in signal_df.columns:
+        # Apply conditional formatting to P&L column
+def color_pl(val):
+                if not isinstance(val, str):
+                return ''
+                if "%" not in val:
+                return ''
+                try:
+                value = float(val.replace('%', ''))
+                    if value > 0:
+                    return 'color: green'
+                    elif value < 0:
+                    return 'color: red'
+                    except:
+                pass
+            return ''
+        
+            st.dataframe(
+            signal_df.style.applymap(color_signals, subset=['Signal'])
+                         .applymap(color_pl, subset=['P&L']),
+            use_container_width=True
+        )
+        else:
+        st.dataframe(
+        signal_df.style.applymap(color_signals, subset=['Signal']),
+        use_container_width=True
+        )
+
+def render_signals(data, signal_data=None, symbol=None):
+    """
+    Render signal data with visualization and detailed information
+    
+    Args:
+        data: DataFrame with price data
+        signal_data: Optional pre-calculated signal data (if None, will be calculated)
+        symbol: Trading symbol being analyzed (optional)
+    """
+    from app.signals.generator import analyze_exit_strategy
+    
+    st.header("Signal Analysis")
+    
+        if symbol:
+    
+        st.subheader(f"Symbol: {symbol}")
+    
+        if signal_data is None:
+            if data is not None:
+            signal_data = generate_signals(data)
+            else:
+            st.warning("No data available for signal generation")
+            return
+    
+    # Check if we have signals
+        if signal_data is None or not isinstance(signal_data, pd.DataFrame) or len(signal_data) == 0:
+        st.warning("No data available for signal generation")
+            return
+        
+    # Process all entry/exit pairs for display
+    entry_exit_pairs = []
+    
+    # Get buy and sell signals
+    buy_signals = signal_data[signal_data['buy_signal']] if 'buy_signal' in signal_data.columns else pd.DataFrame()
+    sell_signals = signal_data[signal_data['sell_signal']] if 'sell_signal' in signal_data.columns else pd.DataFrame()
+    
+    # Process buy signals to find exit points
+        for idx, row in buy_signals.iterrows():
+            try:
+            # Create position object
+            entry_price = data.loc[idx, 'close'] if idx in data.index else row.get('signal_price', 0)
+            position = {
+                'type': 'long',
+                'entry_price': entry_price,
+                'entry_time': idx
+            }
+            
+            # Find exit using exit strategy
+            exit_analysis = analyze_exit_strategy(data, position)
+            
+                if exit_analysis['success'] and exit_analysis['action']['close_percent'] > 0:
+            
+                # Calculate exit time based on conditions
+                current_time = idx
+                exit_time = None
+                exit_price = None
+                
+                # Find the appropriate exit time based on the exit reason
+                reason = exit_analysis['action']['reason']
+                
+                # Simulate finding an actual exit timestamp after the entry
+                later_data = data.loc[data.index > idx]
+                
+                    if not later_data.empty:
+                        if reason == 'atr_stop':
+                        # Find when price hit the ATR stop level
+                        atr_stop = exit_analysis['atr_stop']
+                            if position['type'] == 'long':
+                            # For long, find when price fell below ATR stop
+                            stop_hits = later_data[later_data['low'] <= atr_stop]
+                                if not stop_hits.empty:
+                                exit_time = stop_hits.index[0]
+                                exit_price = atr_stop
+                    
+                                elif reason == 'time_exit':
+                        # Calculate time exit point (e.g., 45 min after entry)
+                            if isinstance(idx, pd.Timestamp):
+                            target_time = idx + pd.Timedelta(minutes=45)
+                            # Find closest data point
+                            closest_idx = later_data.index[later_data.index >= target_time]
+                                if len(closest_idx) > 0:
+                                exit_time = closest_idx[0]
+                                exit_price = later_data.loc[exit_time, 'close']
+                    
+                                elif reason == 'profit_target':
+                        # Find when price reached target profit level
+                        profit_target = entry_price * 1.02  # Example 2% profit
+                        target_hits = later_data[later_data['high'] >= profit_target]
+                            if not target_hits.empty:
+                            exit_time = target_hits.index[0]
+                            exit_price = profit_target
+                    
+                            elif reason == 'momentum_exit':
+                        # Use last available point if no specific exit found
+                        # In real implementation, we'd look for RSI > 65 and MACD < 0
+                        exit_time = later_data.index[-1]
+                        exit_price = later_data.loc[exit_time, 'close']
+                    
+                        else:
+                    
+                        # Default to last available point
+                        exit_time = later_data.index[-1]
+                        exit_price = later_data.loc[exit_time, 'close']
+                
+                # If exit time wasn't found, use the last available data point
+                    if exit_time is None and len(data.index) > 0:
+                    exit_time = data.index[-1]
+                    exit_price = data.loc[exit_time, 'close']
+                
+                # Calculate profit/loss
+                    if exit_price is not None and entry_price > 0:
+                    profit_pct = ((exit_price / entry_price) - 1) * 100
+                    else:
+                    profit_pct = 0
+                
+                # Add entry-exit pair to our list
+                entry_exit_pairs.append({
+                    'entry_type': 'BUY',
+                    'entry_time': idx,
+                    'entry_price': entry_price,
+                    'exit_time': exit_time,
+                    'exit_price': exit_price,
+                    'exit_reason': reason.replace('_', ' ').title(),
+                    'exit_percent': exit_analysis['action']['close_percent'],
+                    'profit_pct': profit_pct,
+                    'color': 'green' if profit_pct > 0 else 'red',
+                    'position_type': 'long'
+                })
+                except Exception as e:
+            print(f"Error processing buy signal at {idx}: {str(e)}")
+    
+    # Process sell signals to find exit points
+        for idx, row in sell_signals.iterrows():
+            try:
+            # Create position object
+            entry_price = data.loc[idx, 'close'] if idx in data.index else row.get('signal_price', 0)
+            position = {
+                'type': 'short',
+                'entry_price': entry_price,
+                'entry_time': idx
+            }
+            
+            # Find exit using exit strategy
+            exit_analysis = analyze_exit_strategy(data, position)
+            
+                if exit_analysis['success'] and exit_analysis['action']['close_percent'] > 0:
+            
+                # Calculate exit time based on conditions
+                current_time = idx
+                exit_time = None
+                exit_price = None
+                
+                # Find the appropriate exit time based on the exit reason
+                reason = exit_analysis['action']['reason']
+                
+                # Simulate finding an actual exit timestamp after the entry
+                later_data = data.loc[data.index > idx]
+                
+                    if not later_data.empty:
+                        if reason == 'atr_stop':
+                        # Find when price hit the ATR stop level
+                        atr_stop = exit_analysis['atr_stop']
+                            if position['type'] == 'short':
+                            # For short, find when price rose above ATR stop
+                            stop_hits = later_data[later_data['high'] >= atr_stop]
+                                if not stop_hits.empty:
+                                exit_time = stop_hits.index[0]
+                                exit_price = atr_stop
+                    
+                                elif reason == 'time_exit':
+                        # Calculate time exit point (e.g., 45 min after entry)
+                            if isinstance(idx, pd.Timestamp):
+                            target_time = idx + pd.Timedelta(minutes=45)
+                            # Find closest data point
+                            closest_idx = later_data.index[later_data.index >= target_time]
+                                if len(closest_idx) > 0:
+                                exit_time = closest_idx[0]
+                                exit_price = later_data.loc[exit_time, 'close']
+                    
+                                elif reason == 'profit_target':
+                        # Find when price reached target profit level
+                        profit_target = entry_price * 0.98  # Example 2% drop for short
+                        target_hits = later_data[later_data['low'] <= profit_target]
+                            if not target_hits.empty:
+                            exit_time = target_hits.index[0]
+                            exit_price = profit_target
+                    
+                            elif reason == 'momentum_exit':
+                        # Use last available point if no specific exit found
+                        exit_time = later_data.index[-1]
+                        exit_price = later_data.loc[exit_time, 'close']
+                    
+                        else:
+                    
+                        # Default to last available point
+                        exit_time = later_data.index[-1]
+                        exit_price = later_data.loc[exit_time, 'close']
+                
+                # If exit time wasn't found, use the last available data point
+                    if exit_time is None and len(data.index) > 0:
+                    exit_time = data.index[-1]
+                    exit_price = data.loc[exit_time, 'close']
+                
+                # Calculate profit/loss
+                    if exit_price is not None and entry_price > 0:
+                    profit_pct = ((entry_price / exit_price) - 1) * 100
+                    else:
+                    profit_pct = 0
+                
+                # Add entry-exit pair to our list
+                entry_exit_pairs.append({
+                    'entry_type': 'SELL',
+                    'entry_time': idx,
+                    'entry_price': entry_price,
+                    'exit_time': exit_time,
+                    'exit_price': exit_price,
+                    'exit_reason': reason.replace('_', ' ').title(),
+                    'exit_percent': exit_analysis['action']['close_percent'],
+                    'profit_pct': profit_pct,
+                    'color': 'green' if profit_pct > 0 else 'red',
+                    'position_type': 'short'
+                })
+                except Exception as e:
+            print(f"Error processing sell signal at {idx}: {str(e)}")
+    
+    # Create a price chart with signals marked
+    st.subheader("Price Chart with Entry/Exit Signals")
+    
+        try:
+    
+        # Import plotly to ensure it's available in this function scope
+        import plotly.graph_objects as go
+        
+        # Create candlestick chart with signal points
+        fig = go.Figure()
+        
+        # Add candlestick trace
+        fig.add_trace(
+        go.Candlestick(
+        x=data.index,
+        open=data['open'],
+        high=data['high'],
+        low=data['low'],
+        close=data['close'],
+        name='Price'
+            )
+        )
+        
+        # Add signals as scatter points
+        # Raw Buy Signals
+        buy_signals = signal_data[signal_data['buy_signal']]
+            if not buy_signals.empty:
+            # Create lists to hold data for scatter plot
+            x_vals = buy_signals.index
+            y_vals = data.loc[buy_signals.index, 'low'] * 0.999  # Slightly below low for visibility
+            
+            # Create lists for marker customization based on signal strength
+            marker_sizes = []
+            marker_colors = []
+            marker_symbols = []
+            hover_texts = []
+            
+            # Process each signal to customize based on strength
+                for idx in buy_signals.index:
+                strength = buy_signals.loc[idx, 'buy_strength'] if 'buy_strength' in buy_signals.columns else 1
+                
+                # Map strength value to size (1-4 scale to 10-22 pixel scale)
+                # Increase the size range for better visibility of strong signals
+                size = 10 + (strength * 5)  # Changed from 3 to 5 for more dramatic sizing
+                
+                # Map strength value to opacity (stronger = more opaque)
+                opacity = min(0.3 + (strength * 0.15), 0.9)
+                
+                # Map strength value to color intensity
+                color = f'rgba(0, 255, 0, {opacity})'
+                
+                # Set marker symbol
+                symbol = 'triangle-up'
+                
+                # Set hover text
+                strength_text = "WEAK"
+                    if strength >= 4:
+                    strength_text = "VERY STRONG"
+                    elif strength >= 3:
+                    strength_text = "STRONG"
+                    elif strength >= 2:
+                    strength_text = "MODERATE"
+                    
+                    hover_text = f"BUY: {strength_text} ({strength})"
+                
+                # Add to lists
+                marker_sizes.append(size)
+                marker_colors.append(color)
+                marker_symbols.append(symbol)
+                hover_texts.append(hover_text)
+            
+            # Add trace with customized markers
+            fig.add_trace(
+            go.Scatter(
+            x=x_vals,
+            y=y_vals,
+            mode='markers',
+            marker=dict(
+            symbol=marker_symbols,
+            size=marker_sizes, 
+            color=marker_colors,
+            line=dict(width=1, color='black')
+                    ),
+            text=hover_texts,
+            hoverinfo='text',
+            name='Buy Signals'
+                )
+            )
+        
+        # Raw Sell Signals
+        sell_signals = signal_data[signal_data['sell_signal']]
+            if not sell_signals.empty:
+            # Create lists to hold data for scatter plot
+            x_vals = sell_signals.index
+            y_vals = data.loc[sell_signals.index, 'high'] * 1.001  # Slightly above high for visibility
+            
+            # Create lists for marker customization based on signal strength
+            marker_sizes = []
+            marker_colors = []
+            marker_symbols = []
+            hover_texts = []
+            
+            # Process each signal to customize based on strength
+                for idx in sell_signals.index:
+                strength = sell_signals.loc[idx, 'sell_strength'] if 'sell_strength' in sell_signals.columns else 1
+                
+                # Map strength value to size (1-4 scale to 10-22 pixel scale)
+                size = 10 + (strength * 5)  # Changed from 3 to 5 for more dramatic sizing
+                
+                # Map strength value to opacity (stronger = more opaque)
+                opacity = min(0.3 + (strength * 0.15), 0.9)
+                
+                # Map strength value to color intensity
+                color = f'rgba(255, 0, 0, {opacity})'
+                
+                # Set marker symbol
+                symbol = 'triangle-down'
+                
+                # Set hover text
+                strength_text = "WEAK"
+                    if strength >= 4:
+                    strength_text = "VERY STRONG"
+                    elif strength >= 3:
+                    strength_text = "STRONG"
+                    elif strength >= 2:
+                    strength_text = "MODERATE"
+                    
+                    hover_text = f"SELL: {strength_text} ({strength})"
+                
+                # Add to lists
+                marker_sizes.append(size)
+                marker_colors.append(color)
+                marker_symbols.append(symbol)
+                hover_texts.append(hover_text)
+            
+            # Add trace with customized markers
+            fig.add_trace(
+            go.Scatter(
+            x=x_vals,
+            y=y_vals,
+            mode='markers',
+            marker=dict(
+            symbol=marker_symbols,
+            size=marker_sizes, 
+            color=marker_colors,
+            line=dict(width=1, color='black')
+                    ),
+            text=hover_texts,
+            hoverinfo='text',
+            name='Sell Signals'
+                )
+            )
+        
+        # Add Raw Exit Signals
+        # Exit Buy Signals (Exit Long)
+            if 'exit_buy' in signal_data.columns:
+            exit_buy_signals = signal_data[signal_data['exit_buy']]
+                if not exit_buy_signals.empty:
+                fig.add_trace(
+                go.Scatter(
+                x=exit_buy_signals.index,
+                y=data.loc[exit_buy_signals.index, 'close'] * 1.001,  # Slightly above price for visibility
+                mode='markers',
+                marker=dict(symbol='x', size=10, color='rgba(100, 100, 255, 0.5)'),
+                name='Exit Long Signals'
+                    )
+                )
+                
+        # Exit Sell Signals (Exit Short)
+            if 'exit_sell' in signal_data.columns:
+            exit_sell_signals = signal_data[signal_data['exit_sell']]
+                if not exit_sell_signals.empty:
+                fig.add_trace(
+                go.Scatter(
+                x=exit_sell_signals.index,
+                y=data.loc[exit_sell_signals.index, 'close'] * 0.999,  # Slightly below price for visibility
+                mode='markers',
+                marker=dict(symbol='x', size=10, color='rgba(255, 100, 100, 0.5)'),
+                name='Exit Short Signals'
+                    )
+                )
+                
+        # Filtered Buy Signals
+            if 'filtered_buy_signal' in signal_data.columns:
+            filtered_buys = signal_data[signal_data['filtered_buy_signal']]
+                if not filtered_buys.empty:
+                # Create lists to hold data for scatter plot
+                x_vals = filtered_buys.index
+                y_vals = data.loc[filtered_buys.index, 'low'] * 0.998  # Below raw signals
+                
+                # Create lists for marker customization based on strength
+                marker_sizes = []
+                marker_colors = []
+                hover_texts = []
+                
+                # Process each signal to customize based on strength
+                    for idx in filtered_buys.index:
+                    strength = filtered_buys.loc[idx, 'buy_strength'] if 'buy_strength' in filtered_buys.columns else 2
+                    
+                    # Map strength value to size (1-4 scale to 14-26 pixel scale)
+                    # Increase the size range for better visibility of strong signals
+                    size = 14 + (strength * 6)  # Changed from 3 to 6 for more dramatic sizing of filtered signals
+                    
+                    # Set color based on strength
+                        if strength >= 4:
+                        color = 'rgba(0, 180, 0, 0.9)'  # Very strong (darker green)
+                        elif strength >= 3:
+                        color = 'rgba(0, 210, 0, 0.8)'  # Strong
+                        elif strength >= 2:
+                        color = 'rgba(0, 240, 0, 0.7)'  # Moderate
+                        else:
+                        color = 'rgba(144, 238, 144, 0.6)'  # Weak (light green)
+                    
+                    # Set hover text
+                    strength_text = "WEAK"
+                        if strength >= 4:
+                        strength_text = "VERY STRONG"
+                        elif strength >= 3:
+                        strength_text = "STRONG"
+                        elif strength >= 2:
+                        strength_text = "MODERATE"
+                        
+                        hover_text = f"FILTERED BUY: {strength_text} ({strength})"
+                    
+                    # Add to lists
+                    marker_sizes.append(size)
+                    marker_colors.append(color)
+                    hover_texts.append(hover_text)
+                
+                    fig.add_trace(
+                    go.Scatter(
+                    x=x_vals,
+                    y=y_vals,
+                    mode='markers',
+                    marker=dict(
+                    symbol='triangle-up',
+                    size=marker_sizes, 
+                    color=marker_colors, 
+                    line=dict(width=2, color='black')
+                        ),
+                    text=hover_texts,
+                    hoverinfo='text',
+                    name='Filtered Buy Signals'
+                    )
+                )
+        
+        # Filtered Sell Signals
+            if 'filtered_sell_signal' in signal_data.columns:
+            filtered_sells = signal_data[signal_data['filtered_sell_signal']]
+                if not filtered_sells.empty:
+                # Create lists to hold data for scatter plot
+                x_vals = filtered_sells.index
+                y_vals = data.loc[filtered_sells.index, 'high'] * 1.002  # Above raw signals
+                
+                # Create lists for marker customization based on strength
+                marker_sizes = []
+                marker_colors = []
+                hover_texts = []
+                
+                # Process each signal to customize based on strength
+                    for idx in filtered_sells.index:
+                    strength = filtered_sells.loc[idx, 'sell_strength'] if 'sell_strength' in filtered_sells.columns else 2
+                    
+                    # Map strength value to size (1-4 scale to 14-26 pixel scale)
+                    size = 14 + (strength * 6)  # Changed from 3 to 6 for more dramatic sizing of filtered signals
+                    
+                    # Set color based on strength
+                        if strength >= 4:
+                        color = 'rgba(180, 0, 0, 0.9)'  # Very strong (darker red)
+                        elif strength >= 3:
+                        color = 'rgba(210, 0, 0, 0.8)'  # Strong
+                        elif strength >= 2:
+                        color = 'rgba(240, 0, 0, 0.7)'  # Moderate
+                        else:
+                        color = 'rgba(255, 144, 144, 0.6)'  # Weak (light red)
+                    
+                    # Set hover text
+                    strength_text = "WEAK"
+                        if strength >= 4:
+                        strength_text = "VERY STRONG"
+                        elif strength >= 3:
+                        strength_text = "STRONG"
+                        elif strength >= 2:
+                        strength_text = "MODERATE"
+                        
+                        hover_text = f"FILTERED SELL: {strength_text} ({strength})"
+                    
+                    # Add to lists
+                    marker_sizes.append(size)
+                    marker_colors.append(color)
+                    hover_texts.append(hover_text)
+                
+                    fig.add_trace(
+                    go.Scatter(
+                    x=x_vals,
+                    y=y_vals,
+                    mode='markers',
+                    marker=dict(
+                    symbol='triangle-down', 
+                    size=marker_sizes, 
+                    color=marker_colors, 
+                    line=dict(width=2, color='black')
+                        ),
+                    text=hover_texts,
+                    hoverinfo='text',
+                    name='Filtered Sell Signals'
+                    )
+                )
+        
+        # Add exit points for each entry signal
+            for pair in entry_exit_pairs:
+            # Define color map for exit reasons
+            color_map = {
+                'Atr Stop': 'red',
+                'Momentum Exit': 'orange',
+                'Profit Target': 'green',
+                'Time Exit': 'purple',
+                'End Of Day': 'black'
+            }
+            
+                if pair['exit_time'] is not None and pair['exit_price'] is not None:
+            
+                # Get color based on exit reason
+                marker_color = color_map.get(pair['exit_reason'], 'blue')
+                
+                # Add exit point marker
+                fig.add_trace(
+                go.Scatter(
+                x=[pair['exit_time']],
+                y=[pair['exit_price']],
+                mode='markers',
+                marker=dict(
+                symbol='x', 
+                size=12, 
+                color=marker_color, 
+                line=dict(width=2, color='black')
+                        ),
+                name=f"Exit {pair['position_type'].capitalize()} ({pair['exit_reason']})"
+                    )
+                )
+                
+                # Add line connecting entry to exit
+                fig.add_trace(
+                go.Scatter(
+                x=[pair['entry_time'], pair['exit_time']],
+                y=[pair['entry_price'], pair['exit_price']],
+                mode='lines',
+                line=dict(color=marker_color, width=1, dash='dot'),
+                showlegend=False
+                    )
+                )
+                
+                # Add profit/loss annotation
+                fig.add_annotation(
+                x=pair['exit_time'],
+                y=pair['exit_price'],
+                text=f"{pair['profit_pct']:.1f}%",
+                showarrow=True,
+                arrowhead=1,
+                ax=0,
+                ay=-40,
+                bgcolor=("green" if pair['profit_pct'] > 0 else "red"),
+                font=dict(color="white", size=10)
+                )
+        
+        # Use a clean white theme with gridlines
+        fig.update_layout(
+        title='Price Chart with Trading Signals',
+        xaxis_title='Time',
+        yaxis_title='Price',
+        template='plotly_white',
+        height=600,
+        xaxis_rangeslider_visible=False
+        )
+        
+        # Add signal strength explanation
+        st.info("""
+        **Signal Strength Visualization:**
+        - Signal strength is shown by marker size and color intensity
+        - Weak signals: Small, transparent markers
+        - Moderate signals: Medium-sized markers
+        - Strong signals: Large, more opaque markers
+        - Very Strong signals: Largest, most opaque markers
+        
+        Filtered signals (after ATR filtering) are shown larger than raw signals to highlight high-probability trading opportunities.
+        """)
+
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # Display the entry/exit pairs in a table
+            if entry_exit_pairs:
+            st.subheader("Entry/Exit Pairs")
+            
+            # Create chronological list of all signals
+            all_signals = []
+            
+            # Initialize pairs_data before using it
+            pairs_data = []
+            
+            # Process each pair to extract both entry and exit signals
+                for pair in entry_exit_pairs:
+                    try:
+                    # Format timestamps
+                        if hasattr(pair['entry_time'], 'tzinfo'):
+                        entry_time = pair['entry_time'].strftime('%Y-%m-%d %H:%M:%S')
+                            else:
+                            entry_time = str(pair['entry_time'])
+                        
+                        if hasattr(pair['exit_time'], 'tzinfo'):
+                        
+                        exit_time = pair['exit_time'].strftime('%Y-%m-%d %H:%M:%S') if pair['exit_time'] is not None else "N/A"
+                        else:
+                        exit_time = str(pair['exit_time']) if pair['exit_time'] is not None else "N/A"
+                    
+                    # Format prices
+                    entry_price = f"${pair['entry_price']:.2f}" if pair['entry_price'] is not None else "N/A"
+                    exit_price = f"${pair['exit_price']:.2f}" if pair['exit_price'] is not None else "N/A"
+                    
+                    # Calculate duration
+                    duration_str = "N/A"
+                        if pair['entry_time'] is not None and pair['exit_time'] is not None:
+                             try:
+                             duration = (pair['exit_time'] - pair['entry_time']).total_seconds() / 60
+                             duration_str = f"{duration:.1f} min"
+                             except Exception as e:
+                            print(f"Error calculating duration: {str(e)}")
+                    
+                    # Add pair data with proper error handling for missing keys
+                    pairs_data.append({
+                        "Entry Type": pair.get('entry_type', 'Unknown'),
+                        "Entry Time": entry_time,
+                        "Entry Price": entry_price,
+                        "Exit Time": exit_time,
+                        "Exit Price": exit_price,
+                        "Duration": duration_str,
+                        "Exit Reason": pair.get('exit_reason', 'Unknown'),
+                        "P&L": f"{pair.get('profit_pct', 0.0):.2f}%"
+                    })
+                    
+                    # Add entry signal to chronological list
+                    all_signals.append({
+                        'time': pair['entry_time'],  # Original timestamp for sorting
+                        'time_display': entry_time,
+                        'type': f"ENTRY {pair['entry_type']}",
+                        'price': entry_price,
+                        'details': f"New {pair['entry_type']} position",
+                        'id': id(pair)  # Use object ID to track related signals
+                    })
+                    
+                    # Add exit signal to chronological list if it exists
+                        if pair['exit_time'] is not None:
+                        all_signals.append({
+                            'time': pair['exit_time'],
+                            'time_display': exit_time,
+                            'type': f"EXIT {pair['entry_type']}",
+                            'price': exit_price,
+                            'details': f"Exit reason: {pair.get('exit_reason', 'Unknown')} (P&L: {pair.get('profit_pct', 0.0):.2f}%)",
+                            'id': id(pair)
+                        })
+                        except Exception as e:
+                    print(f"Error processing pair: {str(e)}")
+                    continue
+            
+            # Add raw exit signals to the chronological list
+                if 'exit_buy' in signal_data.columns:
+                exit_buy_signals = signal_data[signal_data['exit_buy']]
+                    for idx in exit_buy_signals.index:
+                    # Skip if this timestamp already has an exit signal from entry-exit pairs
+                        if any(signal.get('time') == idx and 'EXIT' in signal.get('type', '') for signal in all_signals):
+                        continue
+                        
+                    # Format time
+                        if hasattr(idx, 'tzinfo'):
+                        time_display = idx.strftime('%Y-%m-%d %H:%M:%S')
+                            else:
+                            time_display = str(idx)
+                        
+                    # Format price
+                    price = f"${data.loc[idx, 'close']:.2f}" if idx in data.index else "N/A"
+                    
+                    # Get exit reason if available
+                    exit_reason = "Momentum/RSI Weakening"
+                        if 'exit_reason' in signal_data.columns and idx in signal_data.index:
+                        exit_reason = signal_data.at[idx, 'exit_reason'] or exit_reason
+                        
+                        all_signals.append({
+                        'time': idx,
+                        'time_display': time_display,
+                        'type': "EXIT LONG (Signal Only)",
+                        'price': price,
+                        'details': f"Exit reason: {exit_reason}",
+                        'id': None
+                    })
+            
+                if 'exit_sell' in signal_data.columns:
+            
+                exit_sell_signals = signal_data[signal_data['exit_sell']]
+                    for idx in exit_sell_signals.index:
+                    # Skip if this timestamp already has an exit signal from entry-exit pairs
+                        if any(signal.get('time') == idx and 'EXIT' in signal.get('type', '') for signal in all_signals):
+                        continue
+                        
+                    # Format time
+                        if hasattr(idx, 'tzinfo'):
+                        time_display = idx.strftime('%Y-%m-%d %H:%M:%S')
+                        else:
+                        time_display = str(idx)
+                        
+                    # Format price
+                    price = f"${data.loc[idx, 'close']:.2f}" if idx in data.index else "N/A"
+                    
+                    # Get exit reason if available
+                    exit_reason = "Momentum/RSI Strengthening"
+                        if 'exit_reason' in signal_data.columns and idx in signal_data.index:
+                        exit_reason = signal_data.at[idx, 'exit_reason'] or exit_reason
+                        
+                        all_signals.append({
+                        'time': idx,
+                        'time_display': time_display,
+                        'type': "EXIT SHORT (Signal Only)",
+                        'price': price,
+                        'details': f"Exit reason: {exit_reason}",
+                        'id': None
+                    })
+            
+            # Sort all signals chronologically
+            all_signals.sort(key=lambda x: x['time'])
+            
+            # Create dataframe for display
+            chrono_signals_df = pd.DataFrame([
+                {
+                    'Time': signal['time_display'],
+                    'Signal': signal['type'],
+                    'Price': signal['price'],
+                    'Details': signal['details']
+                }
+            for signal in all_signals
+            ])
+            
+            # Apply styling
+def color_signal_type(val):
+                    if "ENTRY BUY" in val:
+                    return "background-color: #d4f7d4; color: #006400"
+                    elif "ENTRY SELL" in val:
+                    return "background-color: #f7d4d4; color: #8b0000"
+                    elif "EXIT LONG" in val:
+                    return "background-color: #d4eaff; color: #0366d6"
+                    elif "EXIT SHORT" in val:
+                    return "background-color: #ffebd4; color: #d66f03"
+                    elif "EXIT" in val:
+                    return "background-color: #e6e6fa; color: #483d8b"
+                return ""
+            
+            # Display chronological signals table
+            st.dataframe(
+            chrono_signals_df.style.applymap(color_signal_type, subset=['Signal']),
+            use_container_width=True
+            )
+            
+            # Original display of pairs data as reference (not chronological)
+                with st.expander("View Original Entry/Exit Pairs"):
+                original_pairs_data = []
+                    for pair in entry_exit_pairs:
+                        try:
+                        # Format timestamps
+                            if hasattr(pair['entry_time'], 'tzinfo'):
+                            entry_time = pair['entry_time'].strftime('%Y-%m-%d %H:%M:%S')
+                            else:
+                            entry_time = str(pair['entry_time'])
+                            
+                            if hasattr(pair['exit_time'], 'tzinfo'):
+                            
+                            exit_time = pair['exit_time'].strftime('%Y-%m-%d %H:%M:%S') if pair['exit_time'] is not None else "N/A"
+                            else:
+                            exit_time = str(pair['exit_time']) if pair['exit_time'] is not None else "N/A"
+                        
+                        # Format prices
+                        entry_price = f"${pair['entry_price']:.2f}" if pair['entry_price'] is not None else "N/A"
+                        exit_price = f"${pair['exit_price']:.2f}" if pair['exit_price'] is not None else "N/A"
+                        
+                        # Calculate duration
+                        duration_str = "N/A"
+                            if pair['entry_time'] is not None and pair['exit_time'] is not None:
+                                 try:
+                                 duration = (pair['exit_time'] - pair['entry_time']).total_seconds() / 60
+                                 duration_str = f"{duration:.1f} min"
+                                 except Exception as e:
+                                print(f"Error calculating duration: {str(e)}")
+                        
+                                original_pairs_data.append({
+                            "Entry Type": pair.get('entry_type', 'Unknown'),
+                            "Entry Time": entry_time,
+                            "Entry Price": entry_price,
+                            "Exit Time": exit_time,
+                            "Exit Price": exit_price,
+                            "Duration": duration_str,
+                            "Exit Reason": pair.get('exit_reason', 'Unknown'),
+                            "P&L": f"{pair.get('profit_pct', 0.0):.2f}%"
+                        })
+                        except Exception as e:
+                        print(f"Error processing pair in expander: {str(e)}")
+                        continue
+                
+                # Create DataFrame
+                pairs_df = pd.DataFrame(original_pairs_data)
+                
+                # Apply styling
+def highlight_pl(val):
+                        if "%" in str(val):
+                             try:
+                             val_float = float(val.replace("%", ""))
+                                if val_float > 0:
+                                return "background-color: #d4f7d4; color: #006400"
+                                elif val_float < 0:
+                                return "background-color: #f7d4d4; color: #8b0000"
+                                except:
+                            pass
+                    return ""
+                
+                # Style the dataframe
+                styled_df = pairs_df.style.applymap(highlight_pl, subset=["P&L"])
+                
+                # Show the table
+                st.dataframe(styled_df, use_container_width=True)
+        
+        # Add exit signal information for the signals
+        st.subheader("Exit Recommendations for Current Positions")
+        
+        # Create exit recommendations for both position types
+        position_types = ['long', 'short']
+        
+            for position_type in position_types:
+            # Create a sample position at current price
+            current_price = data['close'].iloc[-1]
+            entry_time_offset = 15  # minutes ago
+            
+            # Calculate entry time based on offset
+            entry_time = pd.Timestamp.now(tz=pytz.timezone('US/Eastern')) - pd.Timedelta(minutes=entry_time_offset)
+            
+            position = {
+                'type': position_type,
+                'entry_price': current_price,
+                'entry_time': entry_time
+            }
+            
+            # Analyze exit strategy
+            exit_analysis = analyze_exit_strategy(data, position)
+            
+                if exit_analysis['success']:
+            
+                action = exit_analysis['action']
+                
+                # Format action recommendation
+                    if action['close_percent'] == 0:
+                    recommendation = "HOLD position"
+                    color = "blue"
+                    elif action['close_percent'] == 100:
+                    recommendation = "CLOSE 100% of position"
+                    color = "red"
+                    else:
+                    recommendation = f"CLOSE {action['close_percent']}% of position"
+                    color = "orange"
+                
+                # Create expandable section for each position type
+                    with st.expander(f"{position_type.upper()} Position Exit Strategy", expanded=True):
+                    # Display action card with appropriate color
+                    st.markdown(
+                        f"""
+                        <div style="padding: 10px; border-radius: 5px; background-color: {color}; color: white;">
+                            <h3 style="margin: 0;">{recommendation}</h3>
+                            <p style="margin: 5px 0 0 0;">Reason: {action['reason'].replace('_', ' ').title()}</p>
+                        </div>
+                        """, 
+                    unsafe_allow_html=True
+                    )
+                    
+                    # Display metrics
+                    col1, col2, col3 = st.columns(3)
+                    
+                        with col1:
+                        st.metric(
+                            "Current P&L", 
+                        f"{exit_analysis['metrics']['pnl_percent']:.2f}%",
+                        delta=None
+                        )
+                    
+                        with col2:
+                        st.metric(
+                            "Position Age", 
+                        f"{exit_analysis['metrics']['position_age_minutes']:.1f} min",
+                        delta=None
+                        )
+                    
+                        with col3:
+                        st.metric(
+                            "Exit Probability", 
+                        f"{exit_analysis['metrics']['exit_probability']*100:.1f}%",
+                        delta=None
+                        )
+                    
+                    # Display ATR stop level
+                        if exit_analysis['atr_stop'] is not None:
+                        st.markdown(f"**ATR Stop Level**: ${exit_analysis['atr_stop']:.2f}")
+        
+        # Show ATR and Cumulative Movement chart if available
+            if 'atr' in data.columns and 'required_move' in signal_data.columns:
+            st.subheader("ATR Filter Metrics")
+            fig_atr = go.Figure()
+            
+            # Add ATR trace
+            fig_atr.add_trace(
+            go.Scatter(
+            x=data.index,
+            y=data['atr'],
+            mode='lines',
+            name='ATR',
+            line=dict(color='blue', width=1)
+                )
+            )
+            
+            # Add required move threshold
+                if 'required_move' in signal_data.columns:
+                fig_atr.add_trace(
+                go.Scatter(
+                x=signal_data.index,
+                y=signal_data['required_move'],
+                mode='lines',
+                name='Required Move Threshold',
+                line=dict(color='purple', width=1, dash='dash')
+                    )
+                )
+            
+            # Add cumulative move if available
+                if 'cumulative_move' in signal_data.columns:
+                fig_atr.add_trace(
+                go.Scatter(
+                x=signal_data.index,
+                y=signal_data['cumulative_move'],
+                mode='lines',
+                name='Cumulative Price Movement',
+                line=dict(color='orange', width=2)
+                    )
+                )
+                
+            # Use a clean white theme with gridlines
+            fig_atr.update_layout(
+            title='ATR and Price Movement',
+            xaxis_title='Time',
+            yaxis_title='Value',
+            template='plotly_white',
+            height=300,
+            xaxis_rangeslider_visible=False
+            )
+            
+            st.plotly_chart(fig_atr, use_container_width=True)
+            
+            # Show ATR filter configuration
+            st.subheader("ATR Filter Configuration")
+            col1, col2, col3 = st.columns(3)
+            
+            # Try to get values from the signal data
+            atr_period = signal_data.get('atr_period', 20)
+            k_value = signal_data.get('k', 0.82)
+            smoothing = signal_data.get('smoothing', 'ema')
+            
+                with col1:
+                st.metric("ATR Period", atr_period)
+                with col2:
+                st.metric("Threshold Multiplier (k)", round(k_value, 2))
+                with col3:
+                st.metric("ATR Smoothing", smoothing)
+    
+        # Display signal statistics
+        st.subheader("Signal Statistics")
+        
+        # Count signals
+        buy_count = signal_data['buy_signal'].sum()
+        sell_count = signal_data['sell_signal'].sum()
+        filtered_buy_count = signal_data['filtered_buy_signal'].sum() if 'filtered_buy_signal' in signal_data.columns else 0
+        filtered_sell_count = signal_data['filtered_sell_signal'].sum() if 'filtered_sell_signal' in signal_data.columns else 0
+        
+        # Display metrics
+        col1, col2, col3, col4 = st.columns(4)
+            with col1:
+            st.metric("Raw Buy Signals", buy_count)
+            with col2:
+            st.metric("Raw Sell Signals", sell_count)
+            with col3:
+            st.metric("Filtered Buy Signals", filtered_buy_count)
+                if filtered_buy_count < buy_count:
+                st.caption(f"Reduced by {buy_count - filtered_buy_count} signals")
+            with col4:
+            st.metric("Filtered Sell Signals", filtered_sell_count)
+                if filtered_sell_count < sell_count:
+                st.caption(f"Reduced by {sell_count - filtered_sell_count} signals")
+            
+                except Exception as e:
+            
+        st.error(f"Error rendering price chart with signals: {str(e)}")
+        st.code(traceback.format_exc())
+
+    # After creating figure, add new section for sequential entry/exit visualization
+    st.subheader("Sequential Entry/Exit Flow")
+    
+    # Find all signal transitions in chronological order
+    position_flow = []
+    current_position = None
+    
+    # Debug information about signals
+    st.write(f"Signal data columns: {list(signal_data.columns)}")
+    
+    # Check if exit signals exist and display a sample
+        if 'exit_buy' in signal_data.columns:
+        exit_buy_count = signal_data['exit_buy'].sum()
+        st.write(f"Found {exit_buy_count} exit_buy signals")
+        if 'exit_sell' in signal_data.columns:
+        exit_sell_count = signal_data['exit_sell'].sum()
+        st.write(f"Found {exit_sell_count} exit_sell signals")
+    
+    # Modified loop to handle exit signals properly
+        for idx in signal_data.index:
+        # Check for buy entry
+            if 'filtered_buy_signal' in signal_data.columns and signal_data.loc[idx, 'filtered_buy_signal']:
+                 if current_position != 'long':
+                 position_flow.append({
+                    'time': idx,
+                    'action': 'ENTER LONG',
+                    'price': data.loc[idx, 'close'] if idx in data.index else None,
+                    'color': 'green'
+                })
+            current_position = 'long'
+        
+        # Check for sell entry
+            elif 'filtered_sell_signal' in signal_data.columns and signal_data.loc[idx, 'filtered_sell_signal']:
+                if current_position != 'short':
+                position_flow.append({
+                    'time': idx,
+                    'action': 'ENTER SHORT',
+                    'price': data.loc[idx, 'close'] if idx in data.index else None,
+                    'color': 'red'
+                })
+                current_position = 'short'
+        
+        # Check for buy exit - ensure we're using boolean conversion
+            if 'exit_buy' in signal_data.columns and signal_data.loc[idx, 'exit_buy'] == True:
+                 if current_position == 'long':
+                 position_flow.append({
+                    'time': idx,
+                    'action': 'EXIT LONG',
+                    'price': data.loc[idx, 'close'] if idx in data.index else None,
+                    'color': 'blue'
+                })
+            current_position = None
+                else:
+                # Add exit signal even if position tracking is off
+                position_flow.append({
+                    'time': idx,
+                    'action': 'EXIT LONG (no active position)',
+                    'price': data.loc[idx, 'close'] if idx in data.index else None,
+                    'color': 'lightblue'
+                })
+        
+        # Check for sell exit - ensure we're using boolean conversion
+            if 'exit_sell' in signal_data.columns and signal_data.loc[idx, 'exit_sell'] == True:
+                 if current_position == 'short':
+                 position_flow.append({
+                    'time': idx,
+                    'action': 'EXIT SHORT',
+                    'price': data.loc[idx, 'close'] if idx in data.index else None,
+                    'color': 'orange'
+                })
+            current_position = None
+                else:
+                # Add exit signal even if position tracking is off
+                position_flow.append({
+                    'time': idx,
+                    'action': 'EXIT SHORT (no active position)',
+                    'price': data.loc[idx, 'close'] if idx in data.index else None,
+                    'color': 'lightorange'
+                })
+    
+    # If signal_data doesn't have exit signals, check data
+        if not position_flow and 'exit_buy' in data.columns:
+        st.write("Looking for exit signals in the data DataFrame instead...")
+            for idx in data.index:
+            # Check for exit_buy signal in data
+                if data.loc[idx, 'exit_buy'] == True:
+                position_flow.append({
+                    'time': idx,
+                    'action': 'EXIT LONG',
+                    'price': data.loc[idx, 'close'],
+                    'color': 'blue'
+                })
+            
+            # Check for exit_sell signal in data
+                if 'exit_sell' in data.columns and data.loc[idx, 'exit_sell'] == True:
+                position_flow.append({
+                    'time': idx,
+                    'action': 'EXIT SHORT',
+                    'price': data.loc[idx, 'close'],
+                    'color': 'orange'
+                })
+    
+    # If we still have no position flow, generate some example data
+        if not position_flow:
+        st.warning("No data available for signal generation")
+        
+        # Generate some sample data for visualization
+        current_time = pd.Timestamp.now(tz=pytz.timezone('US/Eastern'))
+        sample_times = [
+        current_time - pd.Timedelta(minutes=30),
+        current_time - pd.Timedelta(minutes=25),
+        current_time - pd.Timedelta(minutes=15),
+        current_time - pd.Timedelta(minutes=10)
+        ]
+        
+        sample_flow = [
+            {'time': sample_times[0], 'action': 'ENTER LONG', 'price': 100.25, 'color': 'green'},
+            {'time': sample_times[1], 'action': 'EXIT LONG', 'price': 101.50, 'color': 'blue'},
+            {'time': sample_times[2], 'action': 'ENTER SHORT', 'price': 101.75, 'color': 'red'},
+            {'time': sample_times[3], 'action': 'EXIT SHORT', 'price': 100.80, 'color': 'orange'}
+        ]
+        
+        # Use sample flow for visualization
+        position_flow = sample_flow
+        
+        if position_flow:
+        
+        # Create a DataFrame for display
+        flow_df = pd.DataFrame([
+            {
+                'Time': format_timestamp_as_et(p['time']),
+                'Action': p['action'],
+                'Price': f"${p['price']:.2f}" if p['price'] is not None else "N/A"
+            }
+        for p in position_flow
+        ])
+        
+        # Apply styling based on action type
+def color_action(val):
+                if 'ENTER LONG' in val:
+                return 'background-color: rgba(0, 255, 0, 0.2)'
+                elif 'ENTER SHORT' in val:
+                return 'background-color: rgba(255, 0, 0, 0.2)'
+                elif 'EXIT LONG' in val:
+                return 'background-color: rgba(0, 0, 255, 0.2)'
+                elif 'EXIT SHORT' in val:
+                return 'background-color: rgba(255, 165, 0, 0.2)'
+            return ''
+        
+            st.dataframe(
+            flow_df.style.applymap(color_action, subset=['Action']),
+            use_container_width=True
+        )
+        
+        # Create a timeline visualization
+        st.subheader("Position Timeline")
+        
+        # Convert to list of dictionaries for plotting
+        timeline_data = []
+        
+            for i, p in enumerate(position_flow):
+            # Format time for display
+                if hasattr(p['time'], 'strftime'):
+                time_str = p['time'].strftime('%H:%M:%S')
+                else:
+                time_str = str(p['time'])
+                
+            # Create dictionary for this event
+            timeline_data.append({
+                'Time': time_str,
+                'Action': p['action'],
+                'y': 1,  # Fixed y position
+                'color': p['color']
+            })
+        
+        # Create the timeline chart using plotly
+        import plotly.graph_objects as go
+        fig = go.Figure()
+        
+        # Add markers for each event
+        fig.add_trace(
+        go.Scatter(
+        x=[p['Time'] for p in timeline_data],
+        y=[p['y'] for p in timeline_data],
+        mode='markers+text',
+        marker=dict(
+        size=12,
+        color=[p['color'] for p in timeline_data],
+        symbol='circle'
+                ),
+        text=[p['Action'] for p in timeline_data],
+        textposition='top center',
+        name='Position Events'
+            )
+        )
+        
+        # Add connecting lines
+        fig.add_trace(
+        go.Scatter(
+        x=[p['Time'] for p in timeline_data],
+        y=[p['y'] for p in timeline_data],
+        mode='lines',
+        line=dict(color='gray', width=1, dash='dash'),
+        showlegend=False
+            )
+        )
+        
+        # Format the layout
+        fig.update_layout(
+        title='Sequential Position Management Timeline',
+        xaxis_title='Time',
+        yaxis_visible=False,
+        height=250,
+        margin=dict(l=20, r=20, t=40, b=20),
+        template='plotly_white'
+        )
+        
+        st.plotly_chart(fig, use_container_width=True)
+        else:
+        st.info("No position flow data available for timeline visualization")
+
+def render_orb_signals(data, signals, symbol):
+    """
+    Render Opening Range Breakout signals visualization
+    
+    Args:
+        data (pd.DataFrame): Price data
+        signals (pd.DataFrame): Signals data
+        symbol (str): Trading symbol
+    """
+    st.subheader(f"Opening Range Breakout Analysis: {symbol}")
+    
+    # Debug check for signals
+    st.write("Checking ORB signal data structure:")
+    
+        if 'orb_signal' not in signals.columns:
+    
+        st.warning("No 'orb_signal' column found in signals DataFrame")
+        return
+    
+        orb_signal_count = signals['orb_signal'].sum() if 'orb_signal' in signals.columns else 0
+        st.write(f"Found {orb_signal_count} ORB signals in data")
+    
+    # Check if we have any ORB signals
+        if orb_signal_count == 0:
+        st.warning("No Opening Range Breakout signals detected in this data.")
+        return
+    
+    # Filter to get only the rows with ORB signals
+    orb_data = signals[signals['orb_signal'] == True]
+    
+    # Try to calculate ORB levels directly to make sure we can find them
+    from app.indicators import calculate_opening_range
+    
+        # Ensure we have data in Eastern time
+    eastern = pytz.timezone('US/Eastern')
+    chart_data = data.copy()
+            if chart_data.index.tzinfo is not None:
+            chart_data.index = chart_data.index.tz_convert(eastern)
+        
+        # Calculate opening range
+    orb_high, orb_low = calculate_opening_range(chart_data, minutes=5)
+        
+    # Create a simplified ORB chart first to verify it works
+    import plotly.graph_objects as go
+    fig = go.Figure()
+        
+    # Add candlestick chart
+    fig.add_trace(go.Candlestick(
+    x=chart_data.index,
+    open=chart_data['open'],
+    high=chart_data['high'],
+    low=chart_data['low'],
+    close=chart_data['close'],
+    name='Price'
+        ))
+        
+    # Add ORB levels if available
+            if orb_high is not None:
+            fig.add_shape(
+            type="line",
+            x0=chart_data.index[0],
+            y0=orb_high,
+            x1=chart_data.index[-1],
+            y1=orb_high,
+            line=dict(color="green", width=2, dash="dash"),
+            name="ORB High"
+            )
+            
+            if orb_low is not None:
+            
+            fig.add_shape(
+            type="line",
+            x0=chart_data.index[0],
+            y0=orb_low,
+            x1=chart_data.index[-1],
+            y1=orb_low,
+            line=dict(color="red", width=2, dash="dash"),
+            name="ORB Low"
+            )
+        
+        # Set chart title and labels
+    fig.update_layout(
+    title=f"Opening Range Breakout: {symbol}",
+    xaxis_title="Time",
+    yaxis_title="Price ($)",
+    xaxis_rangeslider_visible=False,
+    height=500
+        )
+        
+    st.plotly_chart(fig, use_container_width=True)
+
+def render_advanced_signals(tf_data_dict, view_mode="primary", symbol=None):
+    """
+    Render advanced signal analysis with multi-timeframe data
+    
+    Args:
+        tf_data_dict (dict): Dictionary containing multi-timeframe data
+        view_mode (str): View mode, either "primary" or "all"
+        symbol (str): Trading symbol being analyzed
+    """
+        if not tf_data_dict or not isinstance(tf_data_dict, dict):
+        st.warning("No multi-timeframe data available")
+        return
+        
+        st.header("Advanced Signal Analysis")
+    
+        if symbol:
+    
+        st.subheader(f"Symbol: {symbol}")
+    
+    # Display the weighted signals section if available
+        if 'weighted_signals' in tf_data_dict:
+        weighted_signals = tf_data_dict['weighted_signals']
+        
+        # Create a table of timeframe signals
+        st.subheader("Multi-Timeframe Analysis")
+        
+        tf_data_rows = []
+            for tf_name, tf_data in weighted_signals.items():
+            signals_data = tf_data['signals']
+            weight = tf_data['weight']
+            
+            # Extract signal direction
+            signal_direction = "Neutral"
+            buy_signal = signals_data.get('buy_signal', False)
+            sell_signal = signals_data.get('sell_signal', False)
+            
+            # Make sure we're evaluating the signals safely
+                if isinstance(buy_signal, bool) and buy_signal:
+                signal_direction = "Buy"
+                elif isinstance(sell_signal, bool) and sell_signal:
+                signal_direction = "Sell"
+            # Handle DataFrame/Series cases explicitly
+                elif not isinstance(buy_signal, bool) and not isinstance(sell_signal, bool):
+                # Convert to bool if it's a DataFrame/Series value
+                    if hasattr(buy_signal, 'item') and buy_signal:
+                    signal_direction = "Buy"
+                    elif hasattr(sell_signal, 'item') and sell_signal:
+                    signal_direction = "Sell"
+            
+            # Extract score (use appropriate field or fallback to default)
+            score = signals_data.get('buy_score', 0) if signal_direction == "Buy" else signals_data.get('sell_score', 0) if signal_direction == "Sell" else 0
+            
+            tf_data_rows.append({
+                "Timeframe": tf_name,
+                "Signal": signal_direction,
+                "Score": f"{int(score * 100)}%" if signal_direction != "Neutral" else "-",
+                "Weight": f"{weight:.1f}"
+            })
+        
+        # Ensure we have data before creating a DataFrame
+            if len(tf_data_rows) > 0:
+            tf_df = pd.DataFrame(tf_data_rows)
+            
+            # Add styling to the dataframe
+def highlight_signal(val):
+                color = 'white'
+                    if val == 'Buy':
+                    color = '#d4f7d4'  # Light green
+                    elif val == 'Sell':
+                    color = '#f7d4d4'  # Light red
+                return f'background-color: {color}'
+            
+                st.dataframe(
+                tf_df.style.applymap(highlight_signal, subset=['Signal']),
+                use_container_width=True
+            )
+    
+    # Create chart visualization with signal strength indicators
+        if 'primary_data' in tf_data_dict and 'final_signal' in tf_data_dict:
+             try:
+             # Use primary timeframe data for the chart
+             data = tf_data_dict['primary_data']
+             signal_data = tf_data_dict.get('primary_signals', pd.DataFrame())
+            
+            # Import plotly for chart creation
+        import plotly.graph_objects as go
+            
+            # Create candlestick chart with signal points
+        fig = go.Figure()
+            
+            # Add candlestick trace
+        fig.add_trace(
+        go.Candlestick(
+        x=data.index,
+        open=data['open'],
+        high=data['high'],
+        low=data['low'],
+        close=data['close'],
+        name='Price'
+                )
+            )
+            
+            # Add signals if we have them
+                if isinstance(signal_data, pd.DataFrame) and not signal_data.empty:
+                # Add signals as scatter points with strength visualization
+                
+                # Raw Buy Signals
+                    if 'buy_signal' in signal_data.columns:
+                    buy_signals = signal_data[signal_data['buy_signal']]
+                        if not buy_signals.empty:
+                        # Create lists to hold data for scatter plot
+                        x_vals = buy_signals.index
+                        y_vals = data.loc[buy_signals.index, 'low'] * 0.999  # Slightly below low for visibility
+                        
+                        # Create lists for marker customization based on signal strength
+                        marker_sizes = []
+                        marker_colors = []
+                        marker_symbols = []
+                        hover_texts = []
+                        
+                        # Process each signal to customize based on strength
+                            for idx in buy_signals.index:
+                            strength = buy_signals.loc[idx, 'buy_strength'] if 'buy_strength' in buy_signals.columns else 1
+                            
+                            # Map strength value to size (1-4 scale to 10-22 pixel scale)
+                            size = 10 + (strength * 5)  # Changed from 3 to 5 for more dramatic sizing
+                            
+                            # Map strength value to opacity (stronger = more opaque)
+                            opacity = min(0.3 + (strength * 0.15), 0.9)
+                            
+                            # Map strength value to color intensity
+                            color = f'rgba(0, 255, 0, {opacity})'
+                            
+                            # Set marker symbol
+                            symbol = 'triangle-up'
+                            
+                            # Set hover text
+                            strength_text = "WEAK"
+                                if strength >= 4:
+                                strength_text = "VERY STRONG"
+                                elif strength >= 3:
+                                strength_text = "STRONG"
+                                elif strength >= 2:
+                                strength_text = "MODERATE"
+                                
+                                hover_text = f"BUY: {strength_text} ({strength})"
+                            
+                            # Add to lists
+                            marker_sizes.append(size)
+                            marker_colors.append(color)
+                            marker_symbols.append(symbol)
+                            hover_texts.append(hover_text)
+                        
+                        # Add trace with customized markers
+                        fig.add_trace(
+                        go.Scatter(
+                        x=x_vals,
+                        y=y_vals,
+                        mode='markers',
+                        marker=dict(
+                        symbol=marker_symbols,
+                        size=marker_sizes, 
+                        color=marker_colors,
+                        line=dict(width=1, color='black')
+                                ),
+                        text=hover_texts,
+                        hoverinfo='text',
+                        name='Buy Signals'
+                            )
+                        )
+                
+                # Raw Sell Signals
+                    if 'sell_signal' in signal_data.columns:
+                    sell_signals = signal_data[signal_data['sell_signal']]
+                        if not sell_signals.empty:
+                        # Create lists to hold data for scatter plot
+                        x_vals = sell_signals.index
+                        y_vals = data.loc[sell_signals.index, 'high'] * 1.001  # Slightly above high for visibility
+                        
+                        # Create lists for marker customization based on signal strength
+                        marker_sizes = []
+                        marker_colors = []
+                        marker_symbols = []
+                        hover_texts = []
+                        
+                        # Process each signal to customize based on strength
+                            for idx in sell_signals.index:
+                            strength = sell_signals.loc[idx, 'sell_strength'] if 'sell_strength' in sell_signals.columns else 1
+                            
+                            # Map strength value to size (1-4 scale to 10-22 pixel scale)
+                            size = 10 + (strength * 5)  # Changed from 3 to 5 for more dramatic sizing
+                            
+                            # Map strength value to opacity (stronger = more opaque)
+                            opacity = min(0.3 + (strength * 0.15), 0.9)
+                            
+                            # Map strength value to color intensity
+                            color = f'rgba(255, 0, 0, {opacity})'
+                            
+                            # Set marker symbol
+                            symbol = 'triangle-down'
+                            
+                            # Set hover text
+                            strength_text = "WEAK"
+                                if strength >= 4:
+                                strength_text = "VERY STRONG"
+                                elif strength >= 3:
+                                strength_text = "STRONG"
+                                elif strength >= 2:
+                                strength_text = "MODERATE"
+                                
+                                hover_text = f"SELL: {strength_text} ({strength})"
+                            
+                            # Add to lists
+                            marker_sizes.append(size)
+                            marker_colors.append(color)
+                            marker_symbols.append(symbol)
+                            hover_texts.append(hover_text)
+                        
+                        # Add trace with customized markers
+                        fig.add_trace(
+                        go.Scatter(
+                        x=x_vals,
+                        y=y_vals,
+                        mode='markers',
+                        marker=dict(
+                        symbol=marker_symbols,
+                        size=marker_sizes, 
+                        color=marker_colors,
+                        line=dict(width=1, color='black')
+                                ),
+                        text=hover_texts,
+                        hoverinfo='text',
+                        name='Sell Signals'
+                            )
+                        )
+            
+            # Update layout
+        fig.update_layout(
+        title='Price Chart with Trading Signals',
+        xaxis_title='Time',
+        yaxis_title='Price',
+        template='plotly_white',
+        height=600,
+        xaxis_rangeslider_visible=False
+            )
+            
+            # Add signal strength explanation
+            st.info("""
+            **Signal Strength Visualization:**
+            - Signal strength is shown by marker size and color intensity
+            - Weak signals: Small, transparent markers
+            - Moderate signals: Medium-sized markers
+            - Strong signals: Large, more opaque markers
+            - Very Strong signals: Largest, most opaque markers
+            
+            Filtered signals (after ATR filtering) are shown larger than raw signals to highlight high-probability trading opportunities.
+            """)
+            
+            # Display the chart
+        st.plotly_chart(fig, use_container_width=True)
+        
+            except Exception as e:
+        
+            st.error(f"Error rendering chart: {str(e)}")
+            import traceback
+            st.code(traceback.format_exc())
+    
+    # If there's a final signal, display it prominently
+        if 'final_signal' in tf_data_dict:
+        final_signal = tf_data_dict['final_signal']
+        
+        col1, col2 = st.columns(2)
+        
+            with col1:
+            signal_type = "BUY" if final_signal.get('buy_signal', False) else "SELL" if final_signal.get('sell_signal', False) else "NEUTRAL"
+            signal_strength = final_signal.get('signal_strength', 1)
+            
+            # Convert signal strength to text
+            strength_map = {1: "WEAK", 2: "MODERATE", 3: "STRONG", 4: "VERY STRONG"}
+            strength_text = strength_map.get(signal_strength, "Unknown")
+            
+            # Display signal with appropriate styling
+                if signal_type == "BUY":
+                st.markdown(f"""
+                <div style="background-color: #d4f7d4; padding: 10px; border-radius: 5px; border: 1px solid #28a745;">
+                    <h2 style="color: #28a745; margin: 0;">BUY SIGNAL ({strength_text})</h2>
+                </div>
+                """, unsafe_allow_html=True)
+                elif signal_type == "SELL":
+                st.markdown(f"""
+                <div style="background-color: #f7d4d4; padding: 10px; border-radius: 5px; border: 1px solid #dc3545;">
+                    <h2 style="color: #dc3545; margin: 0;">SELL SIGNAL ({strength_text})</h2>
+                </div>
+                """, unsafe_allow_html=True)
+                else:
+                st.markdown(f"""
+                <div style="background-color: #e9ecef; padding: 10px; border-radius: 5px; border: 1px solid #6c757d;">
+                    <h2 style="color: #6c757d; margin: 0;">NEUTRAL</h2>
+                </div>
+                """, unsafe_allow_html=True)
+        
+            with col2:
+            # Display confidence score if available
+            confidence = final_signal.get('confidence', None)
+                if confidence is not None:
+                st.metric("Signal Confidence", f"{int(confidence * 100)}%")
+                
+            # Display other metrics if available
+            score = final_signal.get('buy_score', 0) if signal_type == "BUY" else final_signal.get('sell_score', 0) if signal_type == "SELL" else 0
+                if score:
+                st.metric("Signal Score", f"{int(score * 100)}%") 
+
+def render_exit_strategy_analysis(data, position=None):
+    """
+    Render exit strategy analysis for an open position
+    
+    Args:
+        data (pd.DataFrame): OHLCV price data
+        position (dict, optional): Current position information. If None, allows creating a position.
+    """
+    from app.signals.generator import analyze_exit_strategy
+    import streamlit as st
+    
+    st.subheader("Exit Strategy Analysis")
+    
+    # If no position is provided, allow creating one
+        if position is None:
+        st.write("No active position. Enter position details:")
+        
+        col1, col2, col3 = st.columns(3)
+            with col1:
+            position_type = st.radio("Position Type", ['long', 'short'])
+            with col2:
+            entry_price = st.number_input("Entry Price", min_value=0.01, value=data['close'].iloc[-1], step=0.01)
+            with col3:
+            entry_time_offset = st.number_input("Position Age (minutes)", min_value=1, value=15, step=1)
+            
+        # Calculate entry time based on offset
+        entry_time = pd.Timestamp.now(tz=pytz.timezone('US/Eastern')) - pd.Timedelta(minutes=entry_time_offset)
+        
+        position = {
+            'type': position_type,
+            'entry_price': entry_price,
+            'entry_time': entry_time
+        }
+    
+    # Analyze exit strategy
+    exit_analysis = analyze_exit_strategy(data, position)
+    
+        if not exit_analysis['success']:
+    
+        st.error(f"Error analyzing exit strategy: {exit_analysis.get('error', 'Unknown error')}")
+        return
+    
+    # Display action recommendation
+    action = exit_analysis['action']
+    
+    # Create exit action card
+    st.markdown("### Exit Action")
+    
+    # Format action recommendation
+        if action['close_percent'] == 0:
+        recommendation = "HOLD position"
+        color = "blue"
+        elif action['close_percent'] == 100:
+        recommendation = "CLOSE 100% of position"
+        color = "red"
+        else:
+        recommendation = f"CLOSE {action['close_percent']}% of position"
+        color = "orange"
+    
+    # Display action card with appropriate color
+    st.markdown(
+        f"""
+        <div style="padding: 10px; border-radius: 5px; background-color: {color}; color: white;">
+            <h3 style="margin: 0;">{recommendation}</h3>
+            <p style="margin: 5px 0 0 0;">Reason: {action['reason'].replace('_', ' ').title()}</p>
+        </div>
+        """, 
+    unsafe_allow_html=True
+    )
+    
+    # Display metrics
+    col1, col2, col3 = st.columns(3)
+    
+        with col1:
+        st.metric(
+            "Current P&L", 
+        f"{exit_analysis['metrics']['pnl_percent']:.2f}%",
+        delta=None
+        )
+    
+        with col2:
+        st.metric(
+            "Position Age", 
+        f"{exit_analysis['metrics']['position_age_minutes']:.1f} min",
+        delta=None
+        )
+    
+        with col3:
+        st.metric(
+            "Time-based Exit Probability", 
+        f"{exit_analysis['metrics']['exit_probability']*100:.1f}%",
+        delta=None
+        )
+    
+    # Display ATR stop level
+        if exit_analysis['atr_stop'] is not None:
+        st.markdown(f"**ATR Stop Level**: ${exit_analysis['atr_stop']:.2f}")
+    
+    # Show stop adjustment if recommended
+        if action['adjust_stop']:
+        st.markdown(
+            f"""
+            <div style="padding: 10px; border-radius: 5px; background-color: green; color: white;">
+                <p style="margin: 0;">Adjust stop loss to: ${action['new_stop']:.2f}</p>
+            </div>
+            """, 
+        unsafe_allow_html=True
+        )
+    
+    # Add signals visualization if available
+        if 'signals' in exit_analysis and not exit_analysis['signals'].empty:
+        st.subheader("Exit Signals")
+        
+        # Get the signals dataframe
+        signals_df = exit_analysis['signals']
+        
+        # Show recent signals
+        signals_display = signals_df.tail(10).copy()
+        
+        # Format the DataFrame for display
+            for col in signals_display.columns:
+                if col == 'atr_stop':
+                signals_display[col] = signals_display[col].apply(lambda x: f"${x:.2f}")
+                elif signals_display[col].dtype == bool:
+                signals_display[col] = signals_display[col].apply(lambda x: "✓" if x else "")
+        
+                st.dataframe(signals_display) 

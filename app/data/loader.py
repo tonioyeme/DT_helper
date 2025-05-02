@@ -4,6 +4,8 @@ import numpy as np
 import datetime
 import pytz
 import streamlit as st
+import yfinance as yf
+import traceback
 
 def init_alpaca_client():
     """Initialize Alpaca API client (placeholder)"""
@@ -162,29 +164,159 @@ def load_sample_data(symbol, timeframe, period):
     
     return data
 
-def load_market_data(symbol, timeframe, date_range):
+def load_market_data(symbol, timeframe="1h", date_range="1 Week"):
     """
-    Unified function to load market data from any configured source
+    Load market data for the given symbol and timeframe
+    
+    Args:
+        symbol (str or tuple): Symbol name or (symbol, info) tuple from symbol selection
+        timeframe (str): Timeframe for data (e.g., "1m", "5m", "15m", "30m", "1h", "4h", "1d")
+        date_range (str): Date range to fetch (e.g., "1 Day", "1 Week", "1 Month", "3 Months")
+        
+    Returns:
+        pd.DataFrame: OHLCV data for the symbol
+    """
+    try:
+        # Extract symbol from tuple if needed
+        if isinstance(symbol, tuple):
+            symbol = symbol[0]
+        
+        # Map date range string to Yahoo Finance period
+        if date_range == "Last 1 Day":
+            period = "1d"
+        elif date_range == "Last 3 Days":
+            period = "3d"
+        elif date_range == "Last 5 Days":
+            period = "5d"
+        elif date_range == "Last Week":
+            period = "7d"
+        elif date_range == "Last Month":
+            period = "1mo"
+        elif date_range == "All Data":
+            period = "max"
+        else:
+            period = "7d"  # Default to 1 week
+        
+        # Map timeframe to Yahoo Finance interval
+        if timeframe == "1m":
+            interval = "1m"
+            # For 1m data, Yahoo only allows 7 days max
+            if period not in ["1d", "3d", "5d", "7d"]:
+                st.warning("For 1-minute data, Yahoo Finance only provides up to 7 days. Using 7 days.")
+                period = "7d"
+        elif timeframe == "5m":
+            interval = "5m"
+        elif timeframe == "15m":
+            interval = "15m"
+        elif timeframe == "30m":
+            interval = "30m"
+        elif timeframe == "1h":
+            interval = "60m"
+        elif timeframe == "4h":
+            # Yahoo doesn't have 4h, use 1h and resample later
+            interval = "60m"
+        elif timeframe == "1d":
+            interval = "1d"
+        else:
+            interval = "60m"  # Default to 1h
+        
+        # Download data from Yahoo Finance
+        with st.spinner(f"Loading {symbol} data..."):
+            data = yf.download(symbol, period=period, interval=interval)
+        
+        # Check if we got data
+        if data.empty:
+            st.error(f"No data available for {symbol}")
+            return None
+        
+        # Resample to 4h if needed
+        if timeframe == "4h" and interval == "60m":
+            data = data.resample('4H').agg({
+                'Open': 'first',
+                'High': 'max',
+                'Low': 'min',
+                'Close': 'last',
+                'Volume': 'sum'
+            }).dropna()
+        
+        # Normalize column names
+        data.columns = [col.lower() for col in data.columns]
+        
+        # Add timezone info if missing
+        if isinstance(data.index[0], pd.Timestamp) and data.index[0].tzinfo is None:
+            eastern = pytz.timezone('US/Eastern')
+            data.index = data.index.tz_localize('UTC').tz_convert(eastern)
+        
+        # Store in session state for reuse
+        st.session_state.data = data
+        st.session_state.symbol = symbol
+        
+        return data
+    
+    except Exception as e:
+        st.error(f"Error loading data: {str(e)}")
+        traceback.print_exc()
+        return None
+
+def load_days_data(symbol, days=1, timeframe='5m'):
+    """
+    Load market data for a specific number of days
     
     Args:
         symbol (str): Trading symbol
-        timeframe (str): Time interval
-        date_range (str): Human-readable date range ("Last 1 Day", "Last Week", etc.)
+        days (int): Number of days of data to load
+        timeframe (str): Time interval (default: '5m')
         
     Returns:
         pd.DataFrame: OHLCV data
     """
-    # Map date range to period string
-    period_map = {
-        "Last 1 Day": "1d",
-        "Last 3 Days": "5d", 
-        "Last 5 Days": "5d",
-        "Last Week": "1mo",
-        "Last Month": "1mo",
-        "All Data": "1y"
-    }
+    if days <= 0:
+        days = 1
     
-    period = period_map.get(date_range, "1mo")
+    # Map days to an appropriate period
+    if days <= 1:
+        period = '1d'
+    elif days <= 5:
+        period = '5d'
+    elif days <= 30:
+        period = '1mo'
+    elif days <= 90:
+        period = '3mo'
+    else:
+        period = '1y'
     
-    # For now, always use sample data to avoid external dependencies
-    return load_sample_data(symbol, timeframe, period) 
+    data = load_sample_data(symbol, timeframe, period)
+    
+    # Limit to the exact number of days if needed
+    if data is not None and len(data) > 0:
+        end_time = data.index[-1]
+        start_time = end_time - datetime.timedelta(days=days)
+        data = data[data.index >= start_time]
+    
+    return data
+
+def load_symbol_data(symbol, days=1, timeframe='5m'):
+    """
+    Load market data for a specific symbol
+    
+    Args:
+        symbol (str): Trading symbol
+        days (int): Number of days of data to load
+        timeframe (str): Time interval (default: '5m')
+        
+    Returns:
+        pd.DataFrame: OHLCV data
+    """
+    try:
+        # For SPY, we might want to load from a special source
+        if symbol.upper() == "SPY":
+            # Use our special SPY optimizer
+            data = load_days_data(symbol, days, timeframe)
+        else:
+            # Use standard data loading
+            data = load_days_data(symbol, days, timeframe)
+        
+        return data
+    except Exception as e:
+        print(f"Error loading data for {symbol}: {str(e)}")
+        return None 

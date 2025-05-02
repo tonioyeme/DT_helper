@@ -2,7 +2,7 @@
 Pattern detection modules for technical analysis.
 """
 
-from app.patterns.adapter import (
+from .adapter import (
     identify_head_and_shoulders,
     identify_inverse_head_and_shoulders,
     identify_double_top,

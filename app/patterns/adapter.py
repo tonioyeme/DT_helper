@@ -4,7 +4,7 @@ expected by the signal generator.
 """
 
 import pandas as pd
-from app.patterns.price_action import (
+from .price_action import (
     detect_head_and_shoulders,
     detect_inverted_head_and_shoulders,
     detect_double_top,

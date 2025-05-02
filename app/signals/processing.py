@@ -3,9 +3,13 @@ import numpy as np
 from enum import Enum
 from typing import Dict, List, Optional, Tuple, Union, Any
 import logging
+import traceback
 
 # Import from scoring.py to ensure we're using the same enums
-from app.signals.scoring import MarketRegime, SignalStrength
+from .scoring import MarketRegime, SignalStrength
+
+# Import position manager for sequential exit-entry
+from .position_manager import get_position_manager, SequentialPositionManager
 
 # These enum classes are now imported from scoring.py
 """
@@ -910,20 +914,94 @@ class AdvancedSignalProcessor:
         
         return adjusted_params
 
-# Create a utility function for easier usage
-def calculate_advanced_signal_score(data: pd.DataFrame) -> pd.Series:
+def process_signals_with_position_manager(signals: pd.DataFrame, 
+                                          data: pd.DataFrame) -> pd.DataFrame:
     """
-    Simplified interface for calculating advanced signal scores
+    Process signals using the position manager to ensure proper exit-entry sequencing
     
     Args:
-        data: DataFrame with price and indicator data
+        signals: DataFrame with signals
+        data: DataFrame with OHLCV data
         
     Returns:
-        Series with signal scores from 0 to 1
+        DataFrame with processed signals incorporating exit-entry sequencing
     """
+    if signals.empty or data.empty:
+        return signals
+    
+    # Get the position manager instance (singleton)
+    position_manager = get_position_manager()
+    
+    # Reset the position manager for fresh signal processing
+    position_manager.__init__()
+    
+    # Track processed state in the DataFrame
+    signals['position_active'] = False
+    signals['exit_pending'] = False
+    signals['entry_queued'] = False
+    signals['position_direction'] = None
+    signals['execution_price'] = None
+    
+    # Process each signal time step
+    for i, idx in enumerate(signals.index):
+        # Determine signal type at this timestep
+        if signals.loc[idx, 'buy_signal']:
+            signal_type = 'buy'
+        elif signals.loc[idx, 'sell_signal']:
+            signal_type = 'sell'
+        else:
+            signal_type = 'neutral'
+        
+        # Get current price
+        current_price = signals.loc[idx, 'signal_price'] if 'signal_price' in signals.columns else data.loc[idx, 'close']
+        
+        # Extract data up to this point for liquidity/volatility calculation
+        bar_data = data.loc[:idx] if idx in data.index else None
+        
+        # Process through position manager
+        position_manager.process_signal(signal_type, bar_data, current_price, idx)
+        
+        # Update signal DataFrame with position manager state
+        current_position = position_manager.get_current_position()
+        if current_position:
+            signals.loc[idx, 'position_active'] = True
+            signals.loc[idx, 'position_direction'] = current_position.direction
+            signals.loc[idx, 'execution_price'] = current_position.entry_price
+        
+        signals.loc[idx, 'exit_pending'] = position_manager.is_pending_exit()
+        signals.loc[idx, 'entry_queued'] = position_manager.has_queued_signals()
+        
+        # Handle signal suppression during exit sequences
+        if position_manager.is_pending_exit():
+            # Disable conflicting entry signals during exit sequence
+            if current_position and current_position.direction == 'buy':
+                signals.loc[idx, 'sell_signal'] = False
+            elif current_position and current_position.direction == 'sell':
+                signals.loc[idx, 'buy_signal'] = False
+        
+        # Get trading state for monitoring
+        if i % 10 == 0:  # Log every 10 bars to reduce verbosity
+            trading_state = position_manager.get_trading_state()
+            print(f"Position state at {idx}: {trading_state}")
+    
+    return signals
+
+def calculate_advanced_signal_score(data: pd.DataFrame) -> pd.Series:
+    """Enhanced signal score calculation with advanced signal processor"""
     processor = AdvancedSignalProcessor()
-    result = processor.calculate_signal_score(data)
-    return result.get('signal_score', pd.Series(0, index=data.index))
+    scores = processor.calculate_signal_score(data)
+    
+    # Create signals DataFrame
+    signals = pd.DataFrame(index=data.index)
+    signals['buy_score'] = scores['buy']
+    signals['sell_score'] = scores['sell']
+    signals['buy_signal'] = scores['buy'] > 0.6
+    signals['sell_signal'] = scores['sell'] > 0.6
+    
+    # Process signals with position manager for exit-entry sequencing
+    signals = process_signals_with_position_manager(signals, data)
+    
+    return signals
 
 # Multi-timeframe version of the utility function
 def calculate_multi_timeframe_signal_score(data_dict: Dict[str, pd.DataFrame], 

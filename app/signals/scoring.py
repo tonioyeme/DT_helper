@@ -5,12 +5,18 @@ from enum import Enum
 import logging
 from datetime import datetime, timedelta
 
+# Import indicators if needed
+from indicators import calculate_atr
+from indicators.momentum import calculate_rsi, calculate_macd
+from .exit_signals import get_vix_data
+
 class SignalStrength(Enum):
     """Signal strength classifications"""
-    WEAK = 1      # Low significance, requires additional confirmation
-    MODERATE = 2  # Moderate significance, reasonable confidence
-    STRONG = 3    # Strong significance, high confidence
-    VERY_STRONG = 4  # Very strong significance, highest confidence
+    VERY_WEAK = 1
+    WEAK = 2
+    MODERATE = 3
+    STRONG = 4
+    VERY_STRONG = 5
 
 class MarketRegime(Enum):
     """Market regime classifications"""
@@ -22,6 +28,7 @@ class MarketRegime(Enum):
     LOW_VOLATILITY = "low_volatility"      # Decreased volatility
     BREAKOUT = "breakout"                  # Breaking from a range
     REVERSAL = "reversal"                  # Potential trend reversal
+    UNKNOWN = "unknown"
 
 class IndicatorCategory(Enum):
     """Indicator categories for weighting in the scoring system"""
@@ -116,395 +123,680 @@ def calculate_dynamic_signal_score(indicators, market_regime):
 
 class DynamicSignalScorer:
     """
-    Dynamic signal scoring system that adjusts thresholds based on market conditions,
-    volatility, and indicator performance history
+    Enhanced signal scoring system with regime-specific validation,
+    volatility-adaptive scoring, and multi-layer validation
     """
-    
-    def __init__(self):
-        """Initialize the dynamic scorer"""
-        self.logger = logging.getLogger(__name__)
+    def __init__(self, symbol=None, config=None):
+        self.symbol = symbol
+        self.config = config or {}
+        self.logger = logging.getLogger("DynamicSignalScorer")
+        self.prev_scores = {}
+        self.score_history = []
         
-        # Default thresholds for buy/sell signals
-        self.buy_threshold = 5.0  # Minimum score for a buy signal
-        self.sell_threshold = 5.0  # Minimum score for a sell signal
-        
-        # Store registered indicators with their weights
-        self.indicators = {}
-        
-        # Store indicator performance metrics
-        self.performance_metrics = {}
-        
-        # Market regime weights for different conditions
-        self.regime_adjustments = {
-            MarketRegime.BULL_TREND: {"buy": 0.9, "sell": 1.2},
-            MarketRegime.BEAR_TREND: {"buy": 1.2, "sell": 0.9},
-            MarketRegime.RANGE_BOUND: {"buy": 1.0, "sell": 1.0},
-            MarketRegime.SIDEWAYS: {"buy": 1.1, "sell": 1.1},
-            MarketRegime.HIGH_VOLATILITY: {"buy": 1.2, "sell": 1.2},
-            MarketRegime.LOW_VOLATILITY: {"buy": 0.9, "sell": 0.9},
-            MarketRegime.BREAKOUT: {"buy": 0.8, "sell": 1.1},
-            MarketRegime.REVERSAL: {"buy": 0.7, "sell": 0.7}
-        }
-        
-    def set_baseline_thresholds(self, buy_threshold: float = 5.0, sell_threshold: float = 5.0):
-        """
-        Set baseline thresholds for buy/sell signals
-        
-        Args:
-            buy_threshold: Base threshold for buy signals
-            sell_threshold: Base threshold for sell signals
-        """
-        self.buy_threshold = buy_threshold
-        self.sell_threshold = sell_threshold
-        
-    def register_indicator(self, name: str, category: Any, base_weight: float = 1.0, 
-                          condition_weights: Dict[MarketRegime, float] = None):
-        """
-        Register an indicator with its base weight and condition-specific weights
-        
-        Args:
-            name: Name of the indicator
-            category: Category the indicator belongs to
-            base_weight: Base weight for this indicator
-            condition_weights: Dictionary mapping market regimes to weight multipliers
-        """
-        if condition_weights is None:
-            condition_weights = {}
+        # Configure SPY-specific optimizations
+        if symbol and symbol.upper() == "SPY":
+            self.use_spy_optimizations = True
+            self.spy_config = self._get_spy_config()
+        else:
+            self.use_spy_optimizations = False
             
-        # Store indicator configuration
-        self.indicators[name] = {
-            'name': name,
-            'category': category,
-            'base_weight': base_weight,
-            'condition_weights': condition_weights
-        }
-        
-        # Initialize performance metrics
-        if name not in self.performance_metrics:
-            self.performance_metrics[name] = {
-                'accuracy': 0.75,  # Initial assumed accuracy (75%)
-                'total_signals': 0,
-                'correct_signals': 0,
-                'recent_signals': []  # List of recent signal results
+    def _get_spy_config(self) -> Dict[str, Any]:
+        """Get SPY-specific scoring configuration"""
+        return {
+            'volatility_regimes': {
+                'low': {
+                    'atr_multiplier': 1.8,
+                    'score_threshold': 4.2,
+                    'position_size': 1.2
+                },
+                'normal': {
+                    'atr_multiplier': 2.2,
+                    'score_threshold': 5.0,
+                    'position_size': 1.0
+                },
+                'high': {
+                    'atr_multiplier': 3.0,
+                    'score_threshold': 6.5,
+                    'position_size': 0.7
+                }
+            },
+            'session_adjustments': {
+                'pre_open': {'threshold_adj': 1.3, 'weight_adj': 0.7},
+                'power_hour': {'threshold_adj': 0.8, 'weight_adj': 1.2},
+                'close': {'threshold_adj': 1.1, 'weight_adj': 0.9}
+            },
+            'weight_profile': {
+                'technical': 0.45,
+                'regime': 0.35,
+                'volatility': 0.20
             }
-            
-    def update_indicator_performance(self, indicator_name: str, was_correct: bool):
-        """
-        Update performance metrics for an indicator based on signal accuracy
+        }
         
-        Args:
-            indicator_name: Name of the indicator
-            was_correct: Whether the signal was correct
-        """
-        if indicator_name not in self.performance_metrics:
-            self.logger.warning(f"Indicator {indicator_name} not found in performance metrics")
-            return
-            
-        metrics = self.performance_metrics[indicator_name]
-        
-        # Update signal counts
-        metrics['total_signals'] += 1
-        if was_correct:
-            metrics['correct_signals'] += 1
-            
-        # Update recent signals list (keep last 10)
-        metrics['recent_signals'].append(was_correct)
-        if len(metrics['recent_signals']) > 10:
-            metrics['recent_signals'].pop(0)
-            
-        # Recalculate accuracy
-        metrics['accuracy'] = metrics['correct_signals'] / max(1, metrics['total_signals'])
-        
-        # If we have recent signals, weight them more heavily
-        if metrics['recent_signals']:
-            recent_accuracy = sum(metrics['recent_signals']) / len(metrics['recent_signals'])
-            
-            # Blend overall accuracy with recent accuracy (weighted toward recent)
-            metrics['accuracy'] = (metrics['accuracy'] * 0.3) + (recent_accuracy * 0.7)
-            
-    def calculate_volatility_factor(self, data: pd.DataFrame) -> float:
-        """
-        Calculate a volatility factor based on recent price action
-        
-        Args:
-            data: DataFrame with price data
-            
-        Returns:
-            Volatility factor (multiplier between 0.5 and 1.5)
-        """
-        if data is None or data.empty:
-            return 1.0
-            
-        try:
-            # Use a simple volatility measure: ATR relative to price
-            # First, calculate TR (True Range)
-            high_low = data['high'] - data['low']
-            high_close = abs(data['high'] - data['close'].shift(1))
-            low_close = abs(data['low'] - data['close'].shift(1))
-            
-            tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-            
-            # Calculate ATR (Average True Range) - 14 period
-            atr = tr.rolling(window=14).mean().iloc[-1]
-            
-            # Calculate ATR as a percentage of price
-            atr_pct = atr / data['close'].iloc[-1]
-            
-            # Normalize to a factor between 0.5 and 1.5
-            # Higher volatility = higher factor (more conservative thresholds)
-            if atr_pct < 0.005:  # Less than 0.5% volatility
-                return 0.5  # Low volatility
-            elif atr_pct > 0.03:  # More than 3% volatility
-                return 1.5  # High volatility
-            else:
-                # Scale between 0.5 and 1.5
-                return 0.5 + (atr_pct - 0.005) * (1.0 / 0.025)
-                
-        except Exception as e:
-            self.logger.error(f"Error calculating volatility factor: {str(e)}")
-            return 1.0  # Default to neutral
-            
     def detect_market_regime(self, data: pd.DataFrame) -> MarketRegime:
         """
-        Detect the current market regime based on price data
+        Detect current market regime based on multiple indicators
         
         Args:
-            data: DataFrame with price data
+            data (pd.DataFrame): OHLCV price data with indicators
             
         Returns:
-            MarketRegime enum value
+            MarketRegime: Detected market regime
         """
-        if data is None or data.empty or len(data) < 30:
-            return MarketRegime.SIDEWAYS  # Default to sideways if insufficient data
+        if len(data) < 20:
+            return MarketRegime.UNKNOWN
+        
+        # Calculate needed indicators if not present
+        if 'rsi' not in data.columns:
+            data['rsi'] = calculate_rsi(data)
             
+        if 'atr' not in data.columns:
+            data['atr'] = calculate_atr(data)
+            
+        # Calculate intermediate metrics
+        # 1. Trend detection
+        if 'ema20' not in data.columns:
+            data['ema20'] = data['close'].ewm(span=20).mean()
+            
+        if 'ema50' not in data.columns:
+            data['ema50'] = data['close'].ewm(span=50).mean()
+            
+        # 2. Volatility metrics
+        if 'atr_ratio' not in data.columns:
+            data['atr_ratio'] = data['atr'] / data['close']
+            data['atr_norm'] = data['atr_ratio'] / data['atr_ratio'].rolling(100).mean()
+            
+        # Extract latest values
+        latest = data.iloc[-1]
+        
+        # Get VIX data or use ATR-derived volatility
+        vix_value = data['vix'].iloc[-1] if 'vix' in data.columns else get_vix_data(data)
+        
+        # 1. Determine if trending
+        trend_score = 0
+        
+        # Check price relative to EMAs
+        if latest['close'] > latest['ema20'] > latest['ema50']:
+            trend_score += 2  # Strong uptrend
+        elif latest['close'] > latest['ema20']:
+            trend_score += 1  # Moderate uptrend
+        elif latest['close'] < latest['ema20'] < latest['ema50']:
+            trend_score -= 2  # Strong downtrend
+        elif latest['close'] < latest['ema20']:
+            trend_score -= 1  # Moderate downtrend
+            
+        # Check RSI for trend confirmation
+        if latest['rsi'] > 60:
+            trend_score += 1  # Bullish
+        elif latest['rsi'] < 40:
+            trend_score -= 1  # Bearish
+        
+        # 2. Determine volatility regime
+        is_high_volatility = (vix_value > 25) or (latest['atr_norm'] > 1.5)
+        is_low_volatility = (vix_value < 15) or (latest['atr_norm'] < 0.7)
+        
+        # Determine regime based on trend and volatility
+        if trend_score >= 2 and not is_high_volatility:
+            return MarketRegime.BULL_TREND
+        elif trend_score <= -2 and not is_high_volatility:
+            return MarketRegime.BEAR_TREND
+        elif is_high_volatility:
+            return MarketRegime.HIGH_VOLATILITY
+        elif is_low_volatility:
+            return MarketRegime.LOW_VOLATILITY
+        else:
+            return MarketRegime.SIDEWAYS
+            
+    def validate_regime_signals(self, data: pd.DataFrame, signals: pd.DataFrame, 
+                               regime: Optional[MarketRegime] = None) -> pd.DataFrame:
+        """
+        Validate signals based on the current market regime
+        
+        Args:
+            data (pd.DataFrame): OHLCV price data
+            signals (pd.DataFrame): Signal dataframe
+            regime (MarketRegime, optional): Market regime, if None will be detected
+            
+        Returns:
+            pd.DataFrame: Validated signals
+        """
+        # Detect regime if not provided
+        if regime is None:
+            regime = self.detect_market_regime(data)
+            
+        # Initialize validated signals
+        validated = signals.copy()
+        
+        # Add regime column
+        validated['market_regime'] = regime.value
+        
+        # Define regime indicators that need to confirm
+        regime_indicators = {
+            'trend': ['ema_cross', 'adx', 'price_velocity'],
+            'volatility': ['atr', 'bb_width', 'vix'],
+            'volume': ['obv', 'relative_volume', 'vwap']
+        }
+        
+        # Set confirmation thresholds by regime
+        confirmation_thresholds = {
+            MarketRegime.BULL_TREND: {
+                'buy': 0.6,   # 60% must confirm for buy signals
+                'sell': 0.8   # 80% must confirm for sell signals (more strict)
+            },
+            MarketRegime.BEAR_TREND: {
+                'buy': 0.8,   # 80% must confirm for buy signals (more strict)
+                'sell': 0.6   # 60% must confirm for sell signals
+            },
+            MarketRegime.HIGH_VOLATILITY: {
+                'buy': 0.7,   # 70% must confirm for buy signals
+                'sell': 0.7   # 70% must confirm for sell signals
+            },
+            MarketRegime.LOW_VOLATILITY: {
+                'buy': 0.5,   # 50% must confirm for buy signals (less strict)
+                'sell': 0.5   # 50% must confirm for sell signals (less strict)
+            },
+            MarketRegime.SIDEWAYS: {
+                'buy': 0.65,  # 65% must confirm for buy signals
+                'sell': 0.65  # 65% must confirm for sell signals
+            },
+            MarketRegime.UNKNOWN: {
+                'buy': 0.75,  # 75% must confirm for buy signals (conservative)
+                'sell': 0.75  # 75% must confirm for sell signals (conservative)
+            }
+        }
+        
+        # Get thresholds for current regime
+        thresholds = confirmation_thresholds.get(regime, confirmation_thresholds[MarketRegime.UNKNOWN])
+        
+        # Validate each signal
+        validated['regime_validated_buy'] = False
+        validated['regime_validated_sell'] = False
+        
+        # Function to check if enough indicators confirm the signal
+        def check_confirmation(row, signal_type):
+            if not row.get(f'{signal_type}_signal', False):
+                return False
+                
+            # Count available indicators
+            available_indicators = 0
+            confirmed_indicators = 0
+            
+            # Check trend indicators
+            for ind in regime_indicators['trend']:
+                if f'{ind}_{signal_type}' in row:
+                    available_indicators += 1
+                    if row[f'{ind}_{signal_type}']:
+                        confirmed_indicators += 1
+                        
+            # Check volatility indicators
+            for ind in regime_indicators['volatility']:
+                if f'{ind}_{signal_type}' in row:
+                    available_indicators += 1
+                    if row[f'{ind}_{signal_type}']:
+                        confirmed_indicators += 1
+                        
+            # Check volume indicators
+            for ind in regime_indicators['volume']:
+                if f'{ind}_{signal_type}' in row:
+                    available_indicators += 1
+                    if row[f'{ind}_{signal_type}']:
+                        confirmed_indicators += 1
+            
+            # Calculate confirmation ratio
+            if available_indicators == 0:
+                return True  # No indicators to check
+                
+            confirmation_ratio = confirmed_indicators / available_indicators
+            return confirmation_ratio >= thresholds[signal_type]
+        
+        # Apply validation
+        for idx in validated.index:
+            validated.at[idx, 'regime_validated_buy'] = check_confirmation(validated.loc[idx], 'buy')
+            validated.at[idx, 'regime_validated_sell'] = check_confirmation(validated.loc[idx], 'sell')
+        
+        return validated
+    
+    def dynamic_score_adjustment(self, base_score: float, data: pd.DataFrame) -> float:
+        """
+        Adjust signal score based on volatility state and other factors
+        
+        Args:
+            base_score (float): Initial signal score
+            data (pd.DataFrame): OHLCV price data
+            
+        Returns:
+            float: Adjusted score
+        """
+        # Get volatility state
+        vix_value = data['vix'].iloc[-1] if 'vix' in data.columns else get_vix_data(data)
+        
+        # Determine volatility regime
+        if vix_value > 25:
+            volatility_state = "high"
+        elif vix_value < 15:
+            volatility_state = "low"
+        else:
+            volatility_state = "normal"
+            
+        # Adjust score based on volatility regime
+        if volatility_state == "high":
+            score = base_score * 0.7  # Be more conservative in high volatility
+        elif volatility_state == "low":
+            score = base_score * 1.3  # More aggressive in low volatility
+        else:
+            score = base_score
+            
+        # Apply time-based session adjustments
+        session_adj = self._get_session_adjustment(data)
+        score = score * session_adj['weight_adj']
+        
+        # Apply performance-based decay if we have history
+        if len(self.score_history) > 0:
+            decay_factor = self._calculate_performance_decay()
+            score = score * decay_factor
+            
+        return score
+    
+    def _get_session_adjustment(self, data: pd.DataFrame) -> Dict[str, float]:
+        """Get time-based session adjustments"""
+        session_type = 'regular'
+        result = {'threshold_adj': 1.0, 'weight_adj': 1.0}
+        
+        if len(data) == 0 or not isinstance(data.index, pd.DatetimeIndex):
+            return result
+            
+        # Get current session time
         try:
-            # Calculate some basic indicators to determine regime
+            import pytz
+            from datetime import time
             
-            # 1. Moving averages for trend direction
-            ma_short = data['close'].rolling(window=20).mean()
-            ma_long = data['close'].rolling(window=50).mean()
-            
-            # 2. ATR for volatility
-            high_low = data['high'] - data['low']
-            high_close = abs(data['high'] - data['close'].shift(1))
-            low_close = abs(data['low'] - data['close'].shift(1))
-            
-            tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-            atr = tr.rolling(window=14).mean()
-            
-            # 3. Normalized ATR (ATR as percentage of price)
-            normalized_atr = atr / data['close']
-            
-            # 4. ADX for trend strength
-            plus_dm = data['high'].diff()
-            minus_dm = data['low'].diff()
-            plus_dm[plus_dm < 0] = 0
-            minus_dm[minus_dm > 0] = 0
-            minus_dm = abs(minus_dm)
-            
-            # Get the true range
-            tr_adx = tr
-            
-            # Smooth DM and TR using Wilder's smoothing method
-            period = 14
-            plus_di = 100 * plus_dm.rolling(window=period).sum() / tr_adx.rolling(window=period).sum()
-            minus_di = 100 * minus_dm.rolling(window=period).sum() / tr_adx.rolling(window=period).sum()
-            
-            # Calculate DX and ADX
-            dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
-            adx = dx.rolling(window=period).mean()
-            
-            # Get current values
-            current_adx = adx.iloc[-1]
-            trend_direction = 1 if ma_short.iloc[-1] > ma_long.iloc[-1] else -1
-            current_volatility = normalized_atr.iloc[-1]
-            
-            # Calculate historical volatility average
-            historical_volatility_avg = normalized_atr.iloc[-30:].mean()
-            volatility_ratio = current_volatility / historical_volatility_avg if historical_volatility_avg > 0 else 1
-            
-            # Detect breakout: significant price movement beyond recent range
-            price_range_20d = data['high'].rolling(window=20).max() - data['low'].rolling(window=20).min()
-            avg_range = price_range_20d.iloc[-5:].mean()
-            latest_move = abs(data['close'].iloc[-1] - data['close'].iloc[-5])
-            
-            is_breakout = latest_move > (0.7 * avg_range)
-            
-            # Detect reversal: price crossing over medium-term moving average
-            price_above_ma = data['close'] > ma_long
-            
-            # Check for recent crossing
-            crossed_ma = False
-            if len(price_above_ma) > 5:
-                crossed_ma = price_above_ma.iloc[-1] != price_above_ma.iloc[-5]
+            # Convert to Eastern time if timezone info is available
+            current_time = data.index[-1].time()
+            if hasattr(data.index[-1], 'tzinfo') and data.index[-1].tzinfo is not None:
+                eastern = pytz.timezone('US/Eastern')
+                current_time = data.index[-1].astimezone(eastern).time()
                 
-            # Determine regime based on indicators
-            if current_adx > 25:  # Strong trend
-                if trend_direction > 0:
-                    regime = MarketRegime.BULL_TREND
-                else:
-                    regime = MarketRegime.BEAR_TREND
-            elif current_adx < 15:  # Weak trend
-                if volatility_ratio > 1.5:  # Higher than normal volatility
-                    regime = MarketRegime.HIGH_VOLATILITY
-                elif volatility_ratio < 0.5:  # Lower than normal volatility
-                    regime = MarketRegime.LOW_VOLATILITY
-                else:
-                    regime = MarketRegime.SIDEWAYS
-            else:  # Moderate trend
-                if abs(ma_short.iloc[-1] - ma_long.iloc[-1]) / ma_long.iloc[-1] < 0.01:
-                    # Moving averages are very close = range bound
-                    regime = MarketRegime.RANGE_BOUND
-                elif is_breakout:
-                    regime = MarketRegime.BREAKOUT
-                elif crossed_ma:
-                    regime = MarketRegime.REVERSAL
-                else:
-                    # Default to sideways if nothing else matches
-                    regime = MarketRegime.SIDEWAYS
-                    
-            return regime
+            # Market open (9:30-10:30): Higher volatility, lower threshold
+            if time(9, 30) <= current_time < time(10, 30):
+                session_type = 'pre_open'
+            # Mid-day (10:30-14:30): Normal parameters
+            elif time(10, 30) <= current_time < time(14, 30):
+                session_type = 'regular'
+            # Power hour (14:30-16:00): Higher volatility, higher threshold
+            elif time(14, 30) <= current_time <= time(16, 0):
+                session_type = 'power_hour'
+        except:
+            # In case of any error, return default values
+            return result
             
-        except Exception as e:
-            self.logger.error(f"Error detecting market regime: {str(e)}")
-            return MarketRegime.SIDEWAYS  # Default to sideways on error
+        # Return session adjustments based on configuration
+        if self.use_spy_optimizations and session_type in self.spy_config['session_adjustments']:
+            return self.spy_config['session_adjustments'][session_type]
+        else:
+            # Default session adjustments if not using SPY config
+            session_adjustments = {
+                'pre_open': {'threshold_adj': 1.2, 'weight_adj': 0.8},
+                'power_hour': {'threshold_adj': 0.9, 'weight_adj': 1.1},
+                'regular': {'threshold_adj': 1.0, 'weight_adj': 1.0}
+            }
+            return session_adjustments.get(session_type, result)
+    
+    def _calculate_performance_decay(self) -> float:
+        """Calculate performance-based decay factor"""
+        # Default return if no history
+        if len(self.score_history) < 5:
+            return 1.0
             
-    def get_adjusted_thresholds(self, market_regime: MarketRegime, volatility_factor: float) -> Tuple[float, float]:
+        # Calculate performance metrics
+        win_rate = sum(1 for s in self.score_history if s['outcome'] == 'win') / len(self.score_history)
+        
+        # Calculate decay factor
+        half_life = 90  # Days
+        decay_factor = 0.5 ** (1 / half_life)
+        
+        # Adjust decay based on win rate
+        if win_rate > 0.6:  # Good performance
+            return 1.0 + (1.0 - decay_factor) * 0.5  # Strengthen signals
+        elif win_rate < 0.4:  # Poor performance
+            return decay_factor  # Weaken signals
+        
+        return 1.0  # Neutral
+    
+    def calculate_composite_strength(self, signals: List[Dict]) -> float:
         """
-        Get adjusted buy and sell thresholds based on market conditions and volatility
+        Calculate composite signal strength from multiple signals
         
         Args:
-            market_regime: Current market regime
-            volatility_factor: Volatility factor
+            signals (List[Dict]): List of signal dictionaries with strength
             
         Returns:
-            Tuple of (buy_threshold, sell_threshold)
+            float: Composite signal strength
         """
-        # Get regime adjustments
-        regime_adj = self.regime_adjustments.get(market_regime, {"buy": 1.0, "sell": 1.0})
-        
-        # Apply adjustments to base thresholds
-        adjusted_buy = self.buy_threshold * regime_adj["buy"] * volatility_factor
-        adjusted_sell = self.sell_threshold * regime_adj["sell"] * volatility_factor
-        
-        return (adjusted_buy, adjusted_sell)
-        
-    def score_signal(self, signal_data: Dict[str, Any], market_regime: MarketRegime = None) -> Dict[str, Any]:
+        if not signals:
+            return 0.0
+            
+        return sum([
+            1.5 if s.get('strength') == SignalStrength.VERY_STRONG else
+            1.2 if s.get('strength') == SignalStrength.STRONG else
+            1.0 if s.get('strength') == SignalStrength.MODERATE else
+            0.7 if s.get('strength') == SignalStrength.WEAK else
+            0.5 for s in signals
+        ]) / len(signals)
+    
+    def dynamic_thresholds(self, data: pd.DataFrame) -> Dict[str, float]:
         """
-        Score a set of indicator signals and determine buy/sell actions
+        Calculate dynamic signal thresholds based on market conditions
         
         Args:
-            signal_data: Dictionary with indicator signal data
-            market_regime: Optional market regime (if not provided, will be neutral)
+            data (pd.DataFrame): OHLCV price data
             
         Returns:
-            Dictionary with scored signals and actions
+            Dict[str, float]: Dynamic thresholds for signals
         """
-        if market_regime is None:
-            market_regime = MarketRegime.SIDEWAYS
+        # Base threshold values
+        base = 5.0
+        
+        # Volatility adjustment
+        if 'atr' in data.columns:
+            volatility_adj = data['atr'].iloc[-1] / data['atr'].rolling(100).mean().iloc[-1]
+        else:
+            volatility_adj = 1.0
             
-        # Get volatility factor
-        volatility_factor = 1.0  # Default if not calculated
-        if 'data' in signal_data:
-            volatility_factor = self.calculate_volatility_factor(signal_data['data'])
-        
-        # Get adjusted thresholds - now using lower thresholds for more adaptive approach
-        buy_threshold, sell_threshold = self.get_adjusted_thresholds(market_regime, volatility_factor)
-        
-        # Apply a more permissive factor to thresholds to make them less restrictive
-        buy_threshold *= 0.7  # Reduce the buy threshold by 30%
-        sell_threshold *= 0.7  # Reduce the sell threshold by 30%
-        
-        # Further reduce thresholds in range-bound or breakout conditions
-        if market_regime in [MarketRegime.RANGE_BOUND, MarketRegime.BREAKOUT, MarketRegime.SIDEWAYS]:
-            buy_threshold *= 0.8  # Additional 20% reduction
-            sell_threshold *= 0.8  # Additional 20% reduction
-        
-        result = signal_data.copy()
-        
-        # Add market regime and threshold info
-        result['market_regime'] = market_regime.value
-        result['buy_threshold'] = buy_threshold
-        result['sell_threshold'] = sell_threshold
-        result['volatility_factor'] = volatility_factor
-        
-        # Add scores from weighted indicators
-        if 'buy_signals' in signal_data and 'sell_signals' in signal_data:
-            # Apply indicator-specific weights based on performance and market regime
-            for signal_type in ['buy_signals', 'sell_signals']:
-                for i, signal in enumerate(result[signal_type]):
-                    indicator_name = signal.get('indicator', '')
-                    
-                    if indicator_name in self.indicators and indicator_name in self.performance_metrics:
-                        # Get indicator config
-                        indicator = self.indicators[indicator_name]
-                        
-                        # Get performance metrics
-                        metrics = self.performance_metrics[indicator_name]
-                        
-                        # Calculate weight adjustments
-                        performance_factor = metrics['accuracy'] * 1.5  # 1.0 to 1.5 scale
-                        
-                        # Get regime-specific weight if available
-                        regime_factor = indicator['condition_weights'].get(market_regime, 1.0)
-                        
-                        # Apply adjustments to signal weight
-                        original_weight = signal.get('effective_weight', 1.0)
-                        adjusted_weight = original_weight * performance_factor * regime_factor
-                        
-                        # Update signal with new weight
-                        result[signal_type][i]['effective_weight'] = adjusted_weight
-                        result[signal_type][i]['performance_factor'] = performance_factor
-                        result[signal_type][i]['regime_factor'] = regime_factor
-        
-        # Recalculate buy/sell scores based on adjusted weights
-        buy_score = 0
-        for signal in result.get('buy_signals', []):
-            buy_score += signal.get('effective_weight', 0)
+        # Regime adjustment
+        regime = self.detect_market_regime(data)
+        if regime == MarketRegime.BULL_TREND:
+            regime_adj_buy = 0.9  # Lower threshold for buy in bull trend
+            regime_adj_sell = 1.2  # Higher threshold for sell in bull trend
+        elif regime == MarketRegime.BEAR_TREND:
+            regime_adj_buy = 1.2  # Higher threshold for buy in bear trend
+            regime_adj_sell = 0.9  # Lower threshold for sell in bear trend
+        elif regime == MarketRegime.HIGH_VOLATILITY:
+            regime_adj_buy = 1.3  # Higher threshold in high volatility
+            regime_adj_sell = 1.3
+        else:
+            regime_adj_buy = 1.0  # Default values
+            regime_adj_sell = 1.0
             
-        sell_score = 0
-        for signal in result.get('sell_signals', []):
-            sell_score += signal.get('effective_weight', 0)
-            
-        # Update scores in result
-        result['buy_score'] = buy_score
-        result['sell_score'] = sell_score
+        # Session adjustment
+        session_adj = self._get_session_adjustment(data)
         
-        # Apply dynamic signal scoring
-        try:
-            # Try to use the dynamic scoring if we have category information
-            if 'indicator_categories' in signal_data:
-                dynamic_buy_score = calculate_dynamic_signal_score(
-                    signal_data['indicator_categories'].get('buy', {}), 
-                    market_regime
-                )
-                dynamic_sell_score = calculate_dynamic_signal_score(
-                    signal_data['indicator_categories'].get('sell', {}), 
-                    market_regime
-                )
+        # SPY-specific adjustments if enabled
+        if self.use_spy_optimizations:
+            vix_value = data['vix'].iloc[-1] if 'vix' in data.columns else get_vix_data(data)
+            
+            # Determine volatility regime for SPY
+            vol_regime = 'normal'
+            if vix_value > 25:
+                vol_regime = 'high'
+            elif vix_value < 15:
+                vol_regime = 'low'
                 
-                # Blend the scores (80% dynamic, 20% original) - increased weight on dynamic scoring
-                result['buy_score'] = (0.2 * buy_score) + (0.8 * dynamic_buy_score * 10)  # Scale to comparable range
-                result['sell_score'] = (0.2 * sell_score) + (0.8 * dynamic_sell_score * 10)
+            # Apply SPY-specific threshold based on volatility regime
+            base = self.spy_config['volatility_regimes'][vol_regime]['score_threshold']
+            
+        # Calculate final thresholds
+        return {
+            'buy': base * volatility_adj * regime_adj_buy * session_adj['threshold_adj'],
+            'sell': base * volatility_adj * regime_adj_sell * session_adj['threshold_adj']
+        }
+    
+    def generate_signal(self, data: pd.DataFrame, signals: pd.DataFrame) -> Dict[str, Any]:
+        """
+        Generate final signal with multi-layer validation
+        
+        Args:
+            data (pd.DataFrame): OHLCV price data
+            signals (pd.DataFrame): Signal indicators
+            
+        Returns:
+            Dict[str, Any]: Processed signal result with scores
+        """
+        # Skip if data is too short
+        if len(data) < 20:
+            return {
+                'buy_score': 0,
+                'sell_score': 0,
+                'thresholds': {'buy': 5.0, 'sell': 5.0},
+                'signals': signals,
+                'regime': MarketRegime.UNKNOWN.value,
+                'position_size': 0.5  # Conservative default
+            }
+            
+        # 1. Detect market regime
+        regime = self.detect_market_regime(data)
+        
+        # 2. Validate signals based on regime
+        validated_signals = self.validate_regime_signals(data, signals, regime)
+        
+        # 3. Calculate technical score (40-45% weight)
+        buy_tech_score = self._calculate_technical_score(data, validated_signals, 'buy')
+        sell_tech_score = self._calculate_technical_score(data, validated_signals, 'sell')
+        
+        # 4. Calculate regime score (30-35% weight)
+        buy_regime_score = self._calculate_regime_score(data, regime, 'buy')
+        sell_regime_score = self._calculate_regime_score(data, regime, 'sell')
+        
+        # 5. Calculate volatility adjustment (20% weight)
+        volatility_score = self._calculate_volatility_score(data)
+        
+        # 6. Define weights based on configuration
+        if self.use_spy_optimizations:
+            weights = self.spy_config['weight_profile']
+        else:
+            weights = {
+                'technical': 0.4,
+                'regime': 0.3,
+                'volatility': 0.3
+            }
+            
+        # 7. Calculate composite scores
+        buy_score = (
+            weights['technical'] * buy_tech_score +
+            weights['regime'] * buy_regime_score +
+            weights['volatility'] * volatility_score
+        )
+        
+        sell_score = (
+            weights['technical'] * sell_tech_score +
+            weights['regime'] * sell_regime_score +
+            weights['volatility'] * volatility_score
+        )
+        
+        # 8. Apply dynamic adjustment
+        buy_score = self.dynamic_score_adjustment(buy_score, data)
+        sell_score = self.dynamic_score_adjustment(sell_score, data)
+        
+        # 9. Calculate dynamic thresholds
+        thresholds = self.dynamic_thresholds(data)
+        
+        # 10. Determine position sizing
+        position_size = self._calculate_position_size(data, regime)
+        
+        # Store for history tracking
+        self.prev_scores = {
+            'buy': buy_score,
+            'sell': sell_score,
+            'thresholds': thresholds,
+            'timestamp': data.index[-1]
+        }
+        
+        return {
+            'buy_score': buy_score,
+            'sell_score': sell_score,
+            'thresholds': thresholds,
+            'signals': validated_signals,
+            'regime': regime.value,
+            'position_size': position_size
+        }
+    
+    def _calculate_technical_score(self, data: pd.DataFrame, signals: pd.DataFrame, signal_type: str) -> float:
+        """Calculate technical analysis score component"""
+        # Get relevant signals
+        relevant_cols = [col for col in signals.columns if signal_type in col and signals[col].dtype == bool]
+        
+        if not relevant_cols:
+            return 0.0
+            
+        # Calculate average signal confirmation
+        signal_count = 0
+        confirmed_count = 0
+        
+        for col in relevant_cols:
+            if col == f'{signal_type}_signal':  # Skip the main signal
+                continue
                 
-                # Add the normalized scores for reference
-                result['buy_score_normalized'] = dynamic_buy_score
-                result['sell_score_normalized'] = dynamic_sell_score
-        except Exception as e:
-            self.logger.warning(f"Could not apply dynamic scoring: {str(e)}")
-            # Keep the original scores if dynamic scoring fails
+            # Count valid signals
+            signal_count += 1
+            if signals[col].iloc[-1]:
+                confirmed_count += 1
+                
+        # Calculate confirmation ratio
+        if signal_count == 0:
+            return 0.0
+            
+        confirmation_ratio = confirmed_count / signal_count
         
-        # Lower the score preference ratio for signal detection (less demanding)
-        score_preference_ratio = 1.1  # Previously was implicitly requiring buy > sell
+        # Base technical score (0-10 scale)
+        score = confirmation_ratio * 10
         
-        # Determine final signal based on thresholds
-        result['buy_signal'] = result['buy_score'] >= buy_threshold and result['buy_score'] >= (result['sell_score'] / score_preference_ratio)
-        result['sell_signal'] = result['sell_score'] >= sell_threshold and result['sell_score'] >= (result['buy_score'] / score_preference_ratio)
-        result['neutral_signal'] = not (result['buy_signal'] or result['sell_signal'])
+        # Boost if regime validated
+        if f'regime_validated_{signal_type}' in signals.columns and signals[f'regime_validated_{signal_type}'].iloc[-1]:
+            score *= 1.2
+            
+        return score
+    
+    def _calculate_regime_score(self, data: pd.DataFrame, regime: MarketRegime, signal_type: str) -> float:
+        """Calculate regime alignment score component"""
+        # Different regimes favor different signals
+        regime_alignment = {
+            MarketRegime.BULL_TREND: {'buy': 10.0, 'sell': 4.0},
+            MarketRegime.BEAR_TREND: {'buy': 4.0, 'sell': 10.0},
+            MarketRegime.SIDEWAYS: {'buy': 6.0, 'sell': 6.0},
+            MarketRegime.HIGH_VOLATILITY: {'buy': 5.0, 'sell': 5.0},
+            MarketRegime.LOW_VOLATILITY: {'buy': 7.0, 'sell': 7.0},
+            MarketRegime.UNKNOWN: {'buy': 5.0, 'sell': 5.0}
+        }
         
-        # Add confidence level (0-1 scale)
-        buy_confidence = max(0, min(1, (result['buy_score'] - buy_threshold) / buy_threshold)) if result['buy_signal'] else 0
-        sell_confidence = max(0, min(1, (result['sell_score'] - sell_threshold) / sell_threshold)) if result['sell_signal'] else 0
-        result['confidence'] = max(buy_confidence, sell_confidence)
+        # Get base score from alignment table
+        base_score = regime_alignment.get(regime, regime_alignment[MarketRegime.UNKNOWN])[signal_type]
         
-        return result 
+        # Adjust by recent price action
+        if signal_type == 'buy':
+            # For buy signals, stronger in uptrend
+            if data['close'].iloc[-1] > data['close'].iloc[-5]:
+                base_score *= 1.1
+        else:  # sell signal
+            # For sell signals, stronger in downtrend
+            if data['close'].iloc[-1] < data['close'].iloc[-5]:
+                base_score *= 1.1
+                
+        return base_score
+    
+    def _calculate_volatility_score(self, data: pd.DataFrame) -> float:
+        """Calculate volatility component score"""
+        # Get VIX value
+        vix_value = data['vix'].iloc[-1] if 'vix' in data.columns else get_vix_data(data)
+        
+        # Calculate ATR ratio if available
+        if 'atr' in data.columns:
+            atr_ratio = data['atr'].iloc[-1] / data['close'].iloc[-1]
+            atr_normalized = atr_ratio / data['atr'].rolling(100).mean().iloc[-1]
+        else:
+            atr_normalized = 1.0
+            
+        # Calculate volatility score
+        if vix_value > 30 or atr_normalized > 2.0:
+            # Very high volatility: reduce score
+            return 3.0
+        elif vix_value > 20 or atr_normalized > 1.5:
+            # High volatility: slightly reduce score
+            return 5.0
+        elif vix_value < 12 or atr_normalized < 0.5:
+            # Very low volatility: may be misleading
+            return 6.0
+        else:
+            # Normal volatility: neutral
+            return 8.0
+    
+    def _calculate_position_size(self, data: pd.DataFrame, regime: MarketRegime) -> float:
+        """Calculate optimal position size based on conditions"""
+        # Default position size
+        position_size = 1.0
+        
+        if self.use_spy_optimizations:
+            # Use SPY-specific position sizing
+            vix_value = data['vix'].iloc[-1] if 'vix' in data.columns else get_vix_data(data)
+            
+            # Determine volatility regime
+            vol_regime = 'normal'
+            if vix_value > 25:
+                vol_regime = 'high'
+            elif vix_value < 15:
+                vol_regime = 'low'
+                
+            # Get from config
+            position_size = self.spy_config['volatility_regimes'][vol_regime]['position_size']
+        else:
+            # General position sizing based on regime
+            if regime == MarketRegime.HIGH_VOLATILITY:
+                position_size = 0.7  # Reduce position size in high volatility
+            elif regime == MarketRegime.LOW_VOLATILITY:
+                position_size = 1.2  # Increase position size in low volatility
+                
+        # Cap position size
+        return min(position_size, 1.5)
+        
+    def update_performance(self, signal_result: Dict[str, Any], outcome: str, profit_pct: float):
+        """
+        Update performance history for dynamic adjustments
+        
+        Args:
+            signal_result (Dict[str, Any]): Signal result dictionary
+            outcome (str): 'win' or 'loss'
+            profit_pct (float): Profit/loss percentage
+        """
+        self.score_history.append({
+            'timestamp': signal_result.get('timestamp', pd.Timestamp.now()),
+            'buy_score': signal_result.get('buy_score', 0),
+            'sell_score': signal_result.get('sell_score', 0),
+            'regime': signal_result.get('regime', 'unknown'),
+            'outcome': outcome,
+            'profit_pct': profit_pct
+        })
+        
+        # Keep last 100 results
+        if len(self.score_history) > 100:
+            self.score_history = self.score_history[-100:]
+
+
+# Factory function to create a signal scorer
+def create_signal_scorer(symbol=None, config=None) -> DynamicSignalScorer:
+    """
+    Create a signal scorer instance
+    
+    Args:
+        symbol (str, optional): Trading symbol
+        config (dict, optional): Custom configuration
+        
+    Returns:
+        DynamicSignalScorer: Signal scorer instance
+    """
+    return DynamicSignalScorer(symbol=symbol, config=config)
+
+
+def score_signals(data: pd.DataFrame, signals: pd.DataFrame, symbol=None) -> Dict[str, Any]:
+    """
+    Score signals using the dynamic signal scorer
+    
+    Args:
+        data (pd.DataFrame): OHLCV price data
+        signals (pd.DataFrame): Signal dataframe
+        symbol (str, optional): Trading symbol
+        
+    Returns:
+        Dict[str, Any]: Scored signals result
+    """
+    # Create scorer
+    scorer = create_signal_scorer(symbol=symbol)
+    
+    # Generate scored signals
+    return scorer.generate_signal(data, signals) 

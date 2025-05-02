@@ -8,7 +8,14 @@ import logging
 import traceback
 import warnings
 
-from app.indicators import (
+# Import streamlit conditionally
+try:
+    import streamlit as st
+    STREAMLIT_AVAILABLE = True
+except ImportError:
+    STREAMLIT_AVAILABLE = False
+
+from indicators import (
     calculate_ema,
     calculate_ema_cloud,
     calculate_macd,
@@ -33,7 +40,7 @@ from app.indicators import (
     calculate_atr,
     calculate_adx
 )
-from app.patterns import (
+from patterns import (
     # New price action patterns
     identify_head_and_shoulders,
     identify_inverse_head_and_shoulders,
@@ -47,7 +54,7 @@ from app.patterns import (
     identify_flag
 )
 
-from app.signals.layers import (
+from .layers import (
     IndicatorLayers, IndicatorLayer, Indicator, 
     IndicatorCategory, SignalType,
     create_moving_average_crossover,
@@ -57,33 +64,46 @@ from app.signals.layers import (
     create_standard_layers
 )
 
-from app.signals.timeframes import (
+from .timeframes import (
     TimeFramePriority, TimeFrame, TimeFrameManager,
     create_standard_timeframes
 )
 
 # Import signals and market regime
-from app.signals.scoring import (
-    DynamicSignalScorer, MarketRegime, SignalStrength
+from .scoring import (
+    DynamicSignalScorer, MarketRegime, SignalStrength,
+    create_signal_scorer, score_signals
 )
 
-from app.signals.processing import (
+from .processing import (
     AdvancedSignalProcessor, calculate_advanced_signal_score,
     calculate_multi_timeframe_signal_score
 )
 
 # Import SPY strategy module
 try:
-    from app.signals.spy_strategy import analyze_spy_day_trading
+    from .spy_strategy import analyze_spy_day_trading
 except ImportError:
     analyze_spy_day_trading = None
     print("SPY strategy module not available")
 
 # Import the new multi-timeframe framework
-from app.signals.multi_timeframe import (
+from .multi_timeframe import (
     MultiTimeframeFramework, TimeframeTier, TrendDirection,
     multi_tf_confirmation
 )
+
+# Import the new ATR filter module
+from .filters import apply_atr_filter_to_signals, get_spy_atr_filter_config
+
+# Import exit strategy module
+from .exit_signals import EnhancedExitStrategy, SPY_EXIT_CONFIG, apply_exit_strategy
+
+# Import the signal_functions module for standard signal generation
+from .signal_functions import generate_standard_signals, is_market_hours, calculate_adaptive_rsi, SignalStrength
+
+# Import paired signals module - now that we've resolved the circular dependency
+from .paired_signals import PairedSignalGenerator
 
 # Logging setup
 logger = logging.getLogger(__name__)
@@ -469,1108 +489,6 @@ def create_default_signal_generator() -> SignalGenerator:
     
     return generator
 
-def is_market_hours(timestamp):
-    """
-    Check if the given timestamp is during market hours (9:30 AM - 4:00 PM ET, Monday-Friday)
-    
-    Args:
-        timestamp: Datetime object or index
-        
-    Returns:
-        bool: True if timestamp is during market hours, False otherwise
-    """
-    # If timestamp has no tzinfo, assume it's UTC and convert to Eastern
-    if hasattr(timestamp, 'tzinfo'):
-        if timestamp.tzinfo is None:
-            timestamp = timestamp.replace(tzinfo=pytz.UTC)
-        # Convert to Eastern Time
-        eastern = pytz.timezone('US/Eastern')
-        timestamp = timestamp.astimezone(eastern)
-    else:
-        # If not a datetime, just return True (can't determine)
-        return True
-    
-    # Check if it's a weekday (0 = Monday, 4 = Friday)
-    if timestamp.weekday() > 4:  # Saturday or Sunday
-        return False
-    
-    # Check if during market hours (9:30 AM - 4:00 PM ET)
-    market_open = time(9, 30)
-    market_close = time(16, 0)
-    current_time = timestamp.time()
-    
-    return market_open <= current_time <= market_close
-
-def generate_signals(data):
-    """
-    Generate trading signals based on various indicators
-    
-    Args:
-        data (pd.DataFrame): DataFrame with OHLCV data
-    
-    Returns:
-        pd.DataFrame: DataFrame with signal columns
-    """
-    print(f"Starting signal generation with {len(data)} data points")
-    
-    try:
-        # Check if input data is a valid DataFrame
-        if not isinstance(data, pd.DataFrame):
-            raise ValueError(f"Input data must be a DataFrame, got {type(data)}")
-        
-        # If we have only 1 data point, return a basic signal DataFrame without calculating indicators
-        if len(data) < 2:
-            print(f"Insufficient data points ({len(data)}). At least 2 points are needed for signal generation.")
-            signals = pd.DataFrame(index=data.index)
-            signals["buy_signal"] = False
-            signals["sell_signal"] = False
-            signals["buy_score"] = 0.0
-            signals["sell_score"] = 0.0
-            signals["buy_strength"] = 0
-            signals["strong_buy_signal"] = False
-            signals["strong_sell_signal"] = False
-            signals["signal_price"] = data["close"] if "close" in data.columns else 0
-            signals["target_price"] = None
-            signals["stop_loss"] = None
-            
-            # Convert timestamps to Eastern Time for display
-            eastern = pytz.timezone('US/Eastern')
-            signals["signal_time_et"] = [idx.astimezone(eastern).strftime('%Y-%m-%d %H:%M:%S') if hasattr(idx, 'astimezone') else str(idx)
-                                     for idx in signals.index]
-            signals["market_status"] = ["Closed"] * len(signals)
-            
-            print("Signal generation skipped due to insufficient data")
-            return signals
-        
-        # Ensure required columns exist
-        required_columns = ['open', 'high', 'low', 'close', 'volume']
-        missing_columns = [col for col in required_columns if col not in data.columns]
-        if missing_columns:
-            raise ValueError(f"Input data is missing required columns: {', '.join(missing_columns)}")
-        
-        # Initialize signals DataFrame with necessary columns
-        signals = pd.DataFrame(index=data.index)
-        signals["buy_signal"] = False
-        signals["sell_signal"] = False
-        signals["buy_score"] = 0.0
-        signals["sell_score"] = 0.0
-        signals["buy_strength"] = 0
-        signals["strong_buy_signal"] = False
-        signals["strong_sell_signal"] = False
-        signals["signal_price"] = data["close"]
-        signals["target_price"] = None
-        signals["stop_loss"] = None
-        
-        # Convert timestamps to Eastern Time for display
-        eastern = pytz.timezone('US/Eastern')
-        signals["signal_time_et"] = [idx.astimezone(eastern).strftime('%Y-%m-%d %H:%M:%S') if hasattr(idx, 'astimezone') else str(idx) 
-                                 for idx in signals.index]
-        
-        # Create market hours mask for all data points
-        market_hours_mask = [is_market_hours(idx) for idx in data.index]
-        
-        # Check if we have any market hours data
-        if not any(market_hours_mask):
-            print("No data points during market hours, skipping signal calculation")
-            signals["market_status"] = "Closed"
-            return signals
-        
-        # Mark market status for all data points
-        signals["market_status"] = ["Open" if mask else "Closed" for mask in market_hours_mask]
-        
-        # Create a market hours subset for signal calculation
-        market_data = data.loc[market_hours_mask]
-        
-        # Calculate indicators and generate signals using only market hours data
-        # This section will remain the same as the original implementation
-        # but we'll only process market_data instead of all data
-        
-        # === Calculate indicators for all data to ensure continuity ===
-        fast_ema, slow_ema = calculate_ema_cloud(data, fast_period=5, slow_period=13)
-        rsi = calculate_rsi(data, 14)
-        adaptive_rsi = calculate_adaptive_rsi(data)
-        stoch_k, stoch_d = calculate_stochastic(data)
-        macd, macd_signal, macd_hist = calculate_macd(data)
-        
-        # === Calculate Opening Range Breakout (ORB) signals ===
-        try:
-            # Calculate opening range (first 5 minutes of the trading day)
-            # Convert data index to Eastern Time for proper filtering
-            market_data_copy = market_data.copy()
-            if market_data_copy.index.tzinfo is not None:
-                market_data_copy.index = market_data_copy.index.tz_convert(eastern)
-            
-            # Get the opening range if we have data from market open
-            orb_high, orb_low = calculate_opening_range(market_data_copy, minutes=5)
-            
-            if orb_high is not None and orb_low is not None:
-                # Detect breakout signals
-                # Create opening range data dictionary for detect_orb_breakout
-                or_data = {'high': orb_high, 'low': orb_low}
-                orb_signals = detect_orb_breakout(market_data_copy, or_data)
-                
-                # Merge with signals DataFrame
-                for idx in orb_signals.index:
-                    if idx in signals.index:
-                        if 'orb_breakout_up' in orb_signals.columns and orb_signals.loc[idx, 'orb_breakout_up']:
-                            signals.loc[idx, 'buy_signal'] = True
-                            signals.loc[idx, 'buy_score'] += 0.8  # Strong signal
-                            # Add ORB-specific columns
-                            signals.loc[idx, 'orb_signal'] = True
-                            signals.loc[idx, 'orb_level'] = orb_high
-                            
-                        if 'orb_breakout_down' in orb_signals.columns and orb_signals.loc[idx, 'orb_breakout_down']:
-                            signals.loc[idx, 'sell_signal'] = True
-                            signals.loc[idx, 'sell_score'] += 0.8  # Strong signal
-                            # Add ORB-specific columns
-                            signals.loc[idx, 'orb_signal'] = True
-                            signals.loc[idx, 'orb_level'] = orb_low
-        except Exception as e:
-            print(f"Error calculating ORB signals: {str(e)}")
-        
-        # === Calculate EMA Cloud crossover signals (only for market hours) ===
-        try:
-            # Calculate crossover points
-            signals['ema_cloud_cross_bullish'] = False
-            signals['ema_cloud_cross_bearish'] = False
-            
-            # First point must have both EMAs available
-            valid_indices = fast_ema.dropna().index.intersection(slow_ema.dropna().index)
-            
-            if len(valid_indices) >= 2:
-                # Calculate for remaining points
-                for i in range(1, len(valid_indices)):
-                    current_idx = valid_indices[i]
-                    prev_idx = valid_indices[i-1]
-                    
-                    # Only process market hours points
-                    if current_idx not in market_data.index:
-                        continue
-                    
-                    # Bullish crossover: fast EMA crosses above slow EMA
-                    if fast_ema[prev_idx] <= slow_ema[prev_idx] and fast_ema[current_idx] > slow_ema[current_idx]:
-                        signals.loc[current_idx, 'ema_cloud_cross_bullish'] = True
-                        signals.loc[current_idx, 'buy_signal'] = True
-                        signals.loc[current_idx, 'buy_score'] += 0.7  # Strong signal
-                    
-                    # Bearish crossover: fast EMA crosses below slow EMA
-                    if fast_ema[prev_idx] >= slow_ema[prev_idx] and fast_ema[current_idx] < slow_ema[current_idx]:
-                        signals.loc[current_idx, 'ema_cloud_cross_bearish'] = True
-                        signals.loc[current_idx, 'sell_signal'] = True
-                        signals.loc[current_idx, 'sell_score'] += 0.7  # Strong signal
-        except Exception as e:
-            print(f"Error calculating EMA cloud signals: {str(e)}")
-        
-        # Calculate price trend signals (only for market hours)
-        try:
-            # Use a short SMA to determine trend direction (8-period)
-            sma8 = data['close'].rolling(window=8).mean()
-            sma20 = data['close'].rolling(window=20).mean()
-            
-            # Add trend signals only to market hours data points
-            for idx in market_data.index:
-                if idx in sma8.index and idx in sma20.index:
-                    # Uptrend: current close > SMAs
-                    uptrend = (data.loc[idx, 'close'] > sma8[idx]) and (sma8[idx] > sma20[idx])
-                    downtrend = (data.loc[idx, 'close'] < sma8[idx]) and (sma8[idx] < sma20[idx])
-                    
-                    if uptrend:
-                        signals.loc[idx, 'buy_score'] += 0.2
-                    elif downtrend:
-                        signals.loc[idx, 'sell_score'] += 0.2
-        except Exception as e:
-            print(f"Error calculating trend signals: {str(e)}")
-        
-        # Continue with other indicators, but process only market hours
-        # ...
-
-        # Set signal strength based on buy/sell scores (only for market hours)
-        for idx in market_data.index:
-            # Set buy signals based on score thresholds
-            if signals.at[idx, 'buy_score'] >= 0.8:
-                signals.at[idx, 'buy_signal'] = True
-                signals.at[idx, 'buy_strength'] = SignalStrength.VERY_STRONG.value
-            elif signals.at[idx, 'buy_score'] >= 0.6:
-                signals.at[idx, 'buy_signal'] = True
-                signals.at[idx, 'buy_strength'] = SignalStrength.STRONG.value
-            elif signals.at[idx, 'buy_score'] >= 0.4:
-                signals.at[idx, 'buy_signal'] = True
-                signals.at[idx, 'buy_strength'] = SignalStrength.MODERATE.value
-            
-            # Set sell signals based on score thresholds
-            if signals.at[idx, 'sell_score'] >= 0.8:
-                signals.at[idx, 'sell_signal'] = True
-                signals.at[idx, 'buy_strength'] = SignalStrength.VERY_STRONG.value
-            elif signals.at[idx, 'sell_score'] >= 0.6:
-                signals.at[idx, 'sell_signal'] = True
-                signals.at[idx, 'buy_strength'] = SignalStrength.STRONG.value
-            elif signals.at[idx, 'sell_score'] >= 0.4:
-                signals.at[idx, 'sell_signal'] = True
-                signals.at[idx, 'buy_strength'] = SignalStrength.MODERATE.value
-                
-            # Mark strong signals
-            if signals.at[idx, 'buy_strength'] >= SignalStrength.STRONG.value:
-                if signals.loc[idx, 'buy_signal']:
-                    signals.at[idx, 'strong_buy_signal'] = True
-                elif signals.loc[idx, 'sell_signal']:
-                    signals.at[idx, 'strong_sell_signal'] = True
-        
-        # Count and report signal stats
-        buy_signals = signals['buy_signal'].sum()
-        sell_signals = signals['sell_signal'].sum()
-        print(f"Signal generation complete: {buy_signals} buy signals, {sell_signals} sell signals")
-        
-        return signals
-    
-    except Exception as e:
-        print(f"Error in signal generation: {str(e)}")
-        # Return a minimal valid DataFrame if signal generation fails
-        signals = pd.DataFrame(index=data.index)
-        signals["buy_signal"] = False
-        signals["sell_signal"] = False
-        signals["signal_price"] = data["close"] if "close" in data.columns else 0
-        signals["market_status"] = "Error"
-        return signals
-
-def generate_signals_advanced(data_dict, primary_timeframe):
-    """
-    Generate signals using advanced multi-timeframe analysis.
-    
-    Args:
-        data_dict (dict): Dictionary of dataframes for different timeframes
-        primary_timeframe (str): The primary timeframe to focus on
-        
-    Returns:
-        dict: Results containing signals, market regime, and other analysis information
-    """
-    import pandas as pd
-    import numpy as np
-    from app.signals.processing import AdvancedSignalProcessor
-    from app.indicators.advanced import calculate_market_regime
-    
-    # Initialize results dictionary
-    results = {}
-    
-    # Get primary timeframe data
-    if primary_timeframe not in data_dict:
-        raise ValueError(f"Primary timeframe {primary_timeframe} not found in data dictionary")
-    
-    primary_data = data_dict[primary_timeframe]
-    
-    # Initialize signal processor
-    processor = AdvancedSignalProcessor()
-    
-    # Dictionary to store signals for each timeframe with their weights
-    weighted_signals = {}
-    
-    # Define timeframe weights (higher weight for primary and larger timeframes)
-    # This is simplified - in production you might have more sophisticated weighting
-    default_weights = {
-        '1m': 0.5,   # Smallest timeframe (noisy)
-        '5m': 0.7,
-        '15m': 0.8,
-        '30m': 0.9,
-        '1h': 1.0,   # Standard weight
-        '2h': 1.1,
-        '4h': 1.2,
-        '1d': 1.3,   # Daily has higher weight
-        '1w': 1.4    # Weekly has highest weight
-    }
-    
-    # Process each timeframe
-    for tf, data in data_dict.items():
-        # Skip if data is empty
-        if data is None or len(data) < 20:  # Need minimum data points
-            continue
-            
-        # Generate signals for this timeframe
-        tf_signals = processor.generate_signals(data)
-        
-        # Determine weight for this timeframe
-        weight = default_weights.get(tf, 1.0)
-        
-        # If this is the primary timeframe, give it additional weight
-        if tf == primary_timeframe:
-            weight += 0.2
-            
-        # Store signals with their weight
-        weighted_signals[tf] = {
-            'signals': tf_signals,
-            'weight': weight
-        }
-    
-    # Store the weighted signals in results
-    results['weighted_signals'] = weighted_signals
-    
-    # Determine market regime for the primary timeframe
-    try:
-        market_regime = calculate_market_regime(primary_data)
-        results['market_regime'] = market_regime
-    except Exception as e:
-        # Fallback to default regime if calculation fails
-        results['market_regime'] = 'unknown'
-    
-    # Calculate market metrics (e.g., trend strength, volatility)
-    market_metrics = {}
-    
-    # Simple trend strength calculation (positive = bullish, negative = bearish)
-    try:
-        # Calculate 20-day SMA
-        sma20 = primary_data['close'].rolling(window=20).mean()
-        # Calculate 50-day SMA
-        sma50 = primary_data['close'].rolling(window=50).mean()
-        
-        # If we have enough data
-        if not pd.isna(sma20.iloc[-1]) and not pd.isna(sma50.iloc[-1]):
-            # Trend strength is difference between 20 and 50 SMAs
-            market_metrics['trend_strength'] = (sma20.iloc[-1] / sma50.iloc[-1] - 1) * 100
-        else:
-            market_metrics['trend_strength'] = 0
-    except Exception:
-        market_metrics['trend_strength'] = 0
-    
-    # Simple volatility calculation
-    try:
-        market_metrics['volatility'] = primary_data['close'].pct_change().std() * 100 * np.sqrt(252)  # Annualized
-    except Exception:
-        market_metrics['volatility'] = 0
-        
-    # Volume trend calculation
-    try:
-        if 'volume' in primary_data.columns:
-            # Calculate 20-day volume SMA
-            vol_sma20 = primary_data['volume'].rolling(window=20).mean()
-            # Compare current volume to 20-day average
-            market_metrics['volume_trend'] = primary_data['volume'].iloc[-1] / vol_sma20.iloc[-1] if not pd.isna(vol_sma20.iloc[-1]) else 1.0
-        else:
-            market_metrics['volume_trend'] = 1.0
-    except Exception:
-        market_metrics['volume_trend'] = 1.0
-    
-    # Store market metrics
-    results['market_metrics'] = market_metrics
-    
-    # Generate final signal by combining weighted signals
-    buy_score = 0
-    sell_score = 0
-    total_weight = 0
-    
-    for tf, tf_data in weighted_signals.items():
-        # Skip if we don't have signal data
-        if 'signals' not in tf_data or tf_data['signals'] is None:
-            continue
-            
-        signals = tf_data['signals']
-        weight = tf_data['weight']
-        
-        # Extract latest buy/sell signal status
-        # Handle both boolean and Series cases
-        latest_buy = False
-        latest_sell = False
-        
-        if 'buy_signal' in signals:
-            if isinstance(signals['buy_signal'], pd.Series):
-                if not signals['buy_signal'].empty:
-                    latest_buy = signals['buy_signal'].iloc[-1]
-            elif isinstance(signals['buy_signal'], bool):
-                latest_buy = signals['buy_signal']
-                
-        if 'sell_signal' in signals:
-            if isinstance(signals['sell_signal'], pd.Series):
-                if not signals['sell_signal'].empty:
-                    latest_sell = signals['sell_signal'].iloc[-1]
-            elif isinstance(signals['sell_signal'], bool):
-                latest_sell = signals['sell_signal']
-        
-        # Extract signal scores if available
-        buy_signal_score = 0
-        sell_signal_score = 0
-        
-        if 'buy_score' in signals:
-            if isinstance(signals['buy_score'], pd.Series):
-                if not signals['buy_score'].empty:
-                    buy_signal_score = signals['buy_score'].iloc[-1]
-            elif isinstance(signals['buy_score'], (int, float)):
-                buy_signal_score = signals['buy_score']
-                
-        if 'sell_score' in signals:
-            if isinstance(signals['sell_score'], pd.Series):
-                if not signals['sell_score'].empty:
-                    sell_signal_score = signals['sell_score'].iloc[-1]
-            elif isinstance(signals['sell_score'], (int, float)):
-                sell_signal_score = signals['sell_score']
-        
-        # Add weighted scores
-        if latest_buy:
-            buy_score += weight * (buy_signal_score if buy_signal_score > 0 else 0.5)
-        if latest_sell:
-            sell_score += weight * (sell_signal_score if sell_signal_score > 0 else 0.5)
-            
-        total_weight += weight
-    
-    # Normalize scores
-    if total_weight > 0:
-        buy_score /= total_weight
-        sell_score /= total_weight
-    
-    # Determine final signal
-    final_signal = {
-        'buy_signal': False,
-        'sell_signal': False,
-        'buy_score': buy_score,
-        'sell_score': sell_score,
-        'signal_strength': 0,
-        'confidence': 0
-    }
-    
-    # Decision logic
-    buy_threshold = 0.3  # Minimum score to consider a buy
-    sell_threshold = 0.3  # Minimum score to consider a sell
-    neutral_zone = 0.1   # Zone where both signals might be present
-    
-    # Only set one signal to avoid conflicts
-    if buy_score >= buy_threshold and buy_score > sell_score + neutral_zone:
-        final_signal['buy_signal'] = True
-        final_signal['confidence'] = min(buy_score, 1.0)  # Cap at 1.0
-        
-        # Determine signal strength (1-4 scale)
-        if buy_score >= 0.8:
-            final_signal['signal_strength'] = 4  # Very strong
-        elif buy_score >= 0.6:
-            final_signal['signal_strength'] = 3  # Strong
-        elif buy_score >= 0.4:
-            final_signal['signal_strength'] = 2  # Moderate
-        else:
-            final_signal['signal_strength'] = 1  # Weak
-    elif sell_score >= sell_threshold and sell_score > buy_score + neutral_zone:
-        final_signal['sell_signal'] = True
-        final_signal['confidence'] = min(sell_score, 1.0)  # Cap at 1.0
-        
-        # Determine signal strength (1-4 scale)
-        if sell_score >= 0.8:
-            final_signal['signal_strength'] = 4  # Very strong
-        elif sell_score >= 0.6:
-            final_signal['signal_strength'] = 3  # Strong
-        elif sell_score >= 0.4:
-            final_signal['signal_strength'] = 2  # Moderate
-        else:
-            final_signal['signal_strength'] = 1  # Weak
-    
-    # Store final signal
-    results['final_signal'] = final_signal
-    
-    # Create a DataFrame of signals compatible with the main app's expected format
-    # This ensures the advanced signals can be used directly in place of basic signals
-    primary_signals = primary_data.copy()
-    
-    # Initialize signal columns
-    primary_signals['buy_signal'] = False
-    primary_signals['sell_signal'] = False
-    primary_signals['signal_strength'] = 0
-    
-    # If we have signals from the primary timeframe, use them as a base
-    if primary_timeframe in weighted_signals and 'signals' in weighted_signals[primary_timeframe]:
-        tf_signals = weighted_signals[primary_timeframe]['signals']
-        
-        # Copy over basic signal columns if they exist
-        for col in ['buy_signal', 'sell_signal']:
-            if col in tf_signals.columns:
-                primary_signals[col] = tf_signals[col]
-    
-    # Apply the final signal to the last data point
-    if not primary_signals.empty:
-        # Get the index of the last row
-        last_idx = primary_signals.index[-1]
-        
-        # Set the final signal
-        primary_signals.loc[last_idx, 'buy_signal'] = final_signal['buy_signal']
-        primary_signals.loc[last_idx, 'sell_signal'] = final_signal['sell_signal']
-        primary_signals.loc[last_idx, 'signal_strength'] = final_signal['signal_strength']
-    
-    # Add signal strength to other signals based on market regime
-    # The idea is to boost signal strength in favorable regimes and reduce in unfavorable ones
-    regime = results['market_regime']
-    
-    # Define which regimes are favorable for which signals
-    favorable_buy_regimes = ['bull_trend', 'breakout', 'low_volatility']
-    favorable_sell_regimes = ['bear_trend', 'reversal', 'high_volatility']
-    
-    # Set base strength for existing signals
-    buy_mask = primary_signals['buy_signal'] & (primary_signals['signal_strength'] == 0)
-    sell_mask = primary_signals['sell_signal'] & (primary_signals['signal_strength'] == 0)
-    
-    # Set default strength
-    primary_signals.loc[buy_mask, 'signal_strength'] = 1
-    primary_signals.loc[sell_mask, 'signal_strength'] = 1
-    
-    # Boost signals in favorable regimes
-    if regime in favorable_buy_regimes:
-        primary_signals.loc[buy_mask, 'signal_strength'] += 1
-    if regime in favorable_sell_regimes:
-        primary_signals.loc[sell_mask, 'signal_strength'] += 1
-    
-    # Store the prepared signals in the results
-    results['signals'] = primary_signals
-    
-    return results
-
-def analyze_single_day(data: pd.DataFrame, symbol: str = None) -> Dict[str, Any]:
-    """
-    Analyze a single day of trading data and generate intraday signals
-    
-    Args:
-        data: DataFrame with OHLCV data for a single day
-        symbol: Trading symbol (optional)
-        
-    Returns:
-        Dictionary containing signals and analysis results
-    """
-    try:
-        print(f"Starting single day analysis with {len(data)} data points")
-        
-        # Check for sufficient data but handle smaller datasets more gracefully
-        if data is None:
-            print("No data provided for analysis")
-            return {
-                "success": False,
-                "error": "No data provided for analysis",
-                "signals": pd.DataFrame()
-            }
-            
-        # For very small datasets, return a limited analysis
-        if len(data) < 10:
-            print(f"Limited data for analysis ({len(data)} points). Providing basic analysis only.")
-            
-            # Create a basic result with available information
-            result = {
-                "success": True,
-                "warning": f"Limited data ({len(data)} points). Analysis may be incomplete.",
-                "data": {
-                    "signal_rows": pd.DataFrame(index=data.index),
-                    "signals": pd.DataFrame(index=data.index),
-                }
-            }
-            
-            # Add basic info like last price if available
-            if len(data) > 0 and 'close' in data.columns:
-                result["data"]["last_close"] = data['close'].iloc[-1]
-                
-            # Add session data with limited information
-            result["data"]["session_data"] = {
-                "regular_hours": {
-                    "high": data['high'].max() if 'high' in data.columns else None,
-                    "low": data['low'].min() if 'low' in data.columns else None,
-                    "open": data['open'].iloc[0] if 'open' in data.columns and len(data) > 0 else None,
-                    "close": data['close'].iloc[-1] if 'close' in data.columns and len(data) > 0 else None
-                }
-            }
-            
-            # Skip detailed signal generation for very small datasets
-            return result
-        
-        # Special case: Use SPY-specific strategy for SPY symbol
-        if symbol and symbol.upper() == "SPY" and analyze_spy_day_trading is not None:
-            print("Using SPY-specific day trading strategy")
-            try:
-                spy_results = analyze_spy_day_trading(data)
-                if spy_results.get("success", False):
-                    return spy_results
-                else:
-                    print(f"SPY strategy failed: {spy_results.get('error', 'Unknown error')}. Falling back to standard analysis.")
-            except Exception as e:
-                print(f"Error in SPY day trading analysis: {str(e)}. Falling back to standard analysis.")
-                # Fall through to standard analysis
-        
-        # Make a copy to avoid modifying original data
-        df = data.copy()
-        
-        # Ensure data is for a single day
-        if isinstance(df.index[0], pd.Timestamp):
-            # Get date of first candle (in Eastern time if possible)
-            if df.index[0].tzinfo is not None:
-                eastern_tz = pytz.timezone('US/Eastern')
-                first_date = df.index[0].tz_convert(eastern_tz).date()
-            else:
-                first_date = df.index[0].date()
-            
-            # Filter data for just this one day
-            if df.index[-1].date() != first_date:
-                print(f"Filtering data to single day: {first_date}")
-                df = df[df.index.date == first_date]
-                
-                if len(df) < 10:
-                    print("Insufficient data after filtering to single day")
-                    return {
-                        "success": False,
-                        "error": "Insufficient data after filtering to single day",
-                        "signals": pd.DataFrame()
-                    }
-        
-        # Extract market session data
-        session_data = analyze_session_data(df)
-        
-        # Calculate opening range
-        or_data = calculate_opening_range(df, minutes=15)
-        
-        # Initialize signals DataFrame
-        signals = pd.DataFrame(index=df.index)
-        
-        # Generate basic signal columns
-        signals['buy_signal'] = False
-        signals['sell_signal'] = False
-        signals['buy_score'] = 0.0  
-        signals['sell_score'] = 0.0
-        signals['signal_strength'] = 0.0
-        signals['target_price'] = 0.0
-        signals['stop_loss'] = 0.0
-        signals['signal_price'] = 0.0  # Price at signal time
-        
-        # Convert timestamps to Eastern Time for display
-        signals['signal_time'] = df.index
-        if isinstance(df.index[0], pd.Timestamp) and df.index[0].tzinfo is not None:
-            eastern_tz = pytz.timezone('US/Eastern')
-            # Explicitly convert to Eastern timezone for display
-            signals['signal_time'] = pd.Series([idx.tz_convert(eastern_tz) for idx in df.index], index=df.index)
-            
-            # Verify timestamps are not in the future
-            now = pd.Timestamp.now(tz='UTC')
-            for i, idx in enumerate(signals.index):
-                if idx > now:
-                    # Use current date with the time part from the original timestamp
-                    current_date = datetime.now().date()
-                    time_from_idx = signals.loc[idx, 'signal_time'].time()
-                    corrected_dt = datetime.combine(current_date, time_from_idx)
-                    signals.loc[idx, 'signal_time'] = pd.Timestamp(corrected_dt, tz=eastern_tz)
-        
-        # Calculate indicators
-        # 1. EMA cloud
-        fast_ema, slow_ema = calculate_ema_cloud(df, fast_period=9, slow_period=21)
-        df['fast_ema'] = fast_ema
-        df['slow_ema'] = slow_ema
-        
-        # 2. VWAP
-        try:
-            df['vwap'] = calculate_vwap(df)
-        except Exception as e:
-            print(f"Error calculating VWAP: {e}")
-            df['vwap'] = df['close'].mean()
-        
-        # 3. RSI
-        try:
-            df['rsi'] = calculate_rsi(df, period=14)
-        except Exception as e:
-            print(f"Error calculating RSI: {e}")
-            df['rsi'] = 50  # Neutral value
-        
-        # 4. Stochastic
-        try:
-            df['stoch_k'], df['stoch_d'] = calculate_stochastic(df, k_period=14, d_period=3)
-        except Exception as e:
-            print(f"Error calculating Stochastic: {e}")
-            df['stoch_k'] = 50
-            df['stoch_d'] = 50
-        
-        # 5. ATR for stop loss calculation
-        try:
-            df['atr'] = calculate_atr(df, period=14)
-        except Exception as e:
-            print(f"Error calculating ATR: {e}")
-            df['atr'] = (df['high'] - df['low']).mean()
-        
-        # Detect ORB signals
-        orb_signals = detect_orb_breakout(df, or_data)
-        for col in orb_signals.columns:
-            signals[col] = orb_signals[col]
-        
-        # Get current time (in Eastern) for time-based strategies
-        now = datetime.now(pytz.timezone('US/Eastern'))
-        current_time = now.time()
-        
-        # Determine which session we're in - use proper time objects without timestamp arithmetic
-        morning_session = (current_time >= time(9, 30) and current_time < time(11, 30))
-        midday_session = (current_time >= time(11, 30) and current_time < time(14, 30))
-        closing_session = (current_time >= time(14, 30) and current_time <= time(16, 0))
-        
-        # Apply different strategies based on session
-        for i in range(len(df)):
-            idx = df.index[i]
-            
-            # Skip the first few candles as they often have high volatility
-            if i < 3:
-                continue
-            
-            # Base variables for signal calculation
-            buy_score = 0.0
-            sell_score = 0.0
-            
-            # ---- Morning session strategies ----
-            if morning_session:
-                # 1. Trend following with EMA cloud
-                if df.loc[idx, 'close'] > df.loc[idx, 'fast_ema'] > df.loc[idx, 'slow_ema']:
-                    buy_score += 0.2
-                elif df.loc[idx, 'close'] < df.loc[idx, 'fast_ema'] < df.loc[idx, 'slow_ema']:
-                    sell_score += 0.2
-                
-                # 2. ORB strategy weight is higher in morning session
-                if 'orb_breakout_up' in signals and signals.loc[idx, 'orb_breakout_up']:
-                    buy_score += 0.3
-                if 'orb_breakout_down' in signals and signals.loc[idx, 'orb_breakout_down']:
-                    sell_score += 0.3
-                
-                # 3. VWAP bounces are important in morning
-                if df.loc[idx, 'close'] > df.loc[idx, 'vwap'] and df.loc[idx-1, 'low'] < df.loc[idx-1, 'vwap']:
-                    buy_score += 0.2  # Bounced up from VWAP
-                if df.loc[idx, 'close'] < df.loc[idx, 'vwap'] and df.loc[idx-1, 'high'] > df.loc[idx-1, 'vwap']:
-                    sell_score += 0.2  # Bounced down from VWAP
-            
-            # ---- Midday session strategies ----
-            elif midday_session:
-                # 1. Range trading often works better in midday
-                middle_band = (df['high'].iloc[max(0, i-10):i+1].max() + df['low'].iloc[max(0, i-10):i+1].min()) / 2
-                
-                if df.loc[idx, 'close'] < middle_band and df.loc[idx, 'stoch_k'] < 20 and df.loc[idx, 'stoch_k'] > df.loc[idx, 'stoch_d']:
-                    buy_score += 0.25  # Oversold in range
-                if df.loc[idx, 'close'] > middle_band and df.loc[idx, 'stoch_k'] > 80 and df.loc[idx, 'stoch_k'] < df.loc[idx, 'stoch_d']:
-                    sell_score += 0.25  # Overbought in range
-                
-                # 2. Volume spikes can indicate breakouts in slow sessions
-                avg_volume = df['volume'].iloc[max(0, i-10):i].mean()
-                if df.loc[idx, 'volume'] > 2 * avg_volume:
-                    if df.loc[idx, 'close'] > df.loc[idx, 'open']:
-                        buy_score += 0.15  # Volume spike on up candle
-                    else:
-                        sell_score += 0.15  # Volume spike on down candle
-            
-            # ---- Closing session strategies ----
-            elif closing_session:
-                # 1. Trend continuation is more likely in closing session
-                if df.loc[idx, 'close'] > df.loc[idx, 'vwap'] and df.loc[idx, 'close'] > df.loc[idx, 'fast_ema']:
-                    buy_score += 0.2
-                if df.loc[idx, 'close'] < df.loc[idx, 'vwap'] and df.loc[idx, 'close'] < df.loc[idx, 'fast_ema']:
-                    sell_score += 0.2
-                
-                # 2. Look for late day momentum
-                if df.loc[idx, 'rsi'] > 60 and df.loc[idx, 'rsi'] > df.loc[idx-1, 'rsi']:
-                    buy_score += 0.2
-                if df.loc[idx, 'rsi'] < 40 and df.loc[idx, 'rsi'] < df.loc[idx-1, 'rsi']:
-                    sell_score += 0.2
-            
-            # ---- Universal strategies (apply in all sessions) ----
-            
-            # 1. RSI divergence
-            if i >= 5:
-                # Bullish divergence
-                if (df.iloc[i-5:i+1]['close'].min() < df.iloc[i-5:i]['close'].min() and 
-                    df.iloc[i-5:i+1]['rsi'].min() > df.iloc[i-5:i]['rsi'].min() and
-                    df.loc[idx, 'rsi'] < 40):
-                    buy_score += 0.25
-                
-                # Bearish divergence
-                if (df.iloc[i-5:i+1]['close'].max() > df.iloc[i-5:i]['close'].max() and 
-                    df.iloc[i-5:i+1]['rsi'].max() < df.iloc[i-5:i]['rsi'].max() and
-                    df.loc[idx, 'rsi'] > 60):
-                    sell_score += 0.25
-            
-            # 2. Price action patterns
-            # Bullish engulfing
-            if (df.loc[idx, 'close'] > df.loc[idx, 'open'] and 
-                df.iloc[i-1]['close'] < df.iloc[i-1]['open'] and
-                df.loc[idx, 'close'] > df.iloc[i-1]['open'] and
-                df.loc[idx, 'open'] < df.iloc[i-1]['close']):
-                buy_score += 0.2
-            
-            # Bearish engulfing
-            if (df.loc[idx, 'close'] < df.loc[idx, 'open'] and 
-                df.iloc[i-1]['close'] > df.iloc[i-1]['open'] and
-                df.loc[idx, 'close'] < df.iloc[i-1]['open'] and
-                df.loc[idx, 'open'] > df.iloc[i-1]['close']):
-                sell_score += 0.2
-            
-            # Assign scores and generate signals if they exceed thresholds
-            signals.loc[idx, 'buy_score'] = buy_score
-            signals.loc[idx, 'sell_score'] = sell_score
-            
-            # Only generate signals if scores exceed thresholds
-            if buy_score > 0.4:
-                signals.loc[idx, 'buy_signal'] = True
-                signals.loc[idx, 'signal_strength'] = min(1.0, buy_score)
-                signals.loc[idx, 'signal_price'] = df.loc[idx, 'close']
-                
-                # Set target and stop based on ATR
-                atr_value = df.loc[idx, 'atr']
-                signals.loc[idx, 'target_price'] = df.loc[idx, 'close'] + (atr_value * 2 * signals.loc[idx, 'signal_strength'])
-                signals.loc[idx, 'stop_loss'] = df.loc[idx, 'close'] - (atr_value * 1 * signals.loc[idx, 'signal_strength'])
-            
-            elif sell_score > 0.4:
-                signals.loc[idx, 'sell_signal'] = True
-                signals.loc[idx, 'signal_strength'] = min(1.0, sell_score)
-                signals.loc[idx, 'signal_price'] = df.loc[idx, 'close']
-                
-                # Set target and stop based on ATR
-                atr_value = df.loc[idx, 'atr']
-                signals.loc[idx, 'target_price'] = df.loc[idx, 'close'] - (atr_value * 2 * signals.loc[idx, 'signal_strength'])
-                signals.loc[idx, 'stop_loss'] = df.loc[idx, 'close'] + (atr_value * 1 * signals.loc[idx, 'signal_strength'])
-        
-        # Get only rows with signals
-        signal_rows = signals[(signals['buy_signal'] == True) | (signals['sell_signal'] == True)]
-        
-        # Return analysis results
-        return {
-            "success": True,
-            "data": {
-                "session_data": session_data,
-                "opening_range": or_data,
-                "signals": signals,
-                "signal_rows": signal_rows,
-                "last_close": df['close'].iloc[-1] if not df.empty else None,
-                "last_data_point": df.index[-1] if not df.empty else None
-            }
-        }
-    
-    except Exception as e:
-        print(f"Error in single day analysis: {e}")
-        import traceback
-        traceback.print_exc()
-        return {
-            "success": False,
-            "error": str(e),
-            "signals": pd.DataFrame()
-        }
-
-def analyze_session_data(data: pd.DataFrame) -> Dict[str, Any]:
-    """
-    Extract market session data from the dataframe
-    
-    Args:
-        data: DataFrame with OHLCV data
-        
-    Returns:
-        Dictionary with pre-market, regular hours, and post-market session data
-    """
-    eastern_tz = pytz.timezone('US/Eastern')
-    
-    # Convert index to eastern time if needed
-    if isinstance(data.index[0], pd.Timestamp):
-        df = data.copy()
-        # If timezone info is missing, assume UTC and convert to Eastern
-        if df.index[0].tzinfo is None:
-            df.index = pd.to_datetime(df.index, utc=True)
-        df.index = df.index.tz_convert(eastern_tz)
-    else:
-        # If not timestamp index, just use the original data
-        df = data
-    
-    # Define market sessions
-    pre_market_start = pd.Timestamp('04:00:00', tz=eastern_tz).time()
-    market_open = pd.Timestamp('09:30:00', tz=eastern_tz).time()
-    market_close = pd.Timestamp('16:00:00', tz=eastern_tz).time()
-    post_market_end = pd.Timestamp('20:00:00', tz=eastern_tz).time()
-    
-    # Filter data for each session
-    if isinstance(df.index[0], pd.Timestamp):
-        pre_market = df[(df.index.time >= pre_market_start) & (df.index.time < market_open)]
-        regular_hours = df[(df.index.time >= market_open) & (df.index.time <= market_close)]
-        post_market = df[(df.index.time > market_close) & (df.index.time <= post_market_end)]
-    else:
-        # If not timestamp index, return empty DataFrames
-        pre_market = pd.DataFrame()
-        regular_hours = pd.DataFrame()
-        post_market = pd.DataFrame()
-    
-    # Calculate session stats
-    pm_stats = {}
-    rh_stats = {}
-    post_stats = {}
-    
-    if not pre_market.empty:
-        pm_stats = {
-            'open': pre_market['open'].iloc[0],
-            'high': pre_market['high'].max(),
-            'low': pre_market['low'].min(),
-            'close': pre_market['close'].iloc[-1],
-            'volume': pre_market['volume'].sum()
-        }
-    
-    if not regular_hours.empty:
-        rh_stats = {
-            'open': regular_hours['open'].iloc[0],
-            'high': regular_hours['high'].max(),
-            'low': regular_hours['low'].min(),
-            'close': regular_hours['close'].iloc[-1],
-            'volume': regular_hours['volume'].sum()
-        }
-    
-    if not post_market.empty:
-        post_stats = {
-            'open': post_market['open'].iloc[0],
-            'high': post_market['high'].max(),
-            'low': post_market['low'].min(),
-            'close': post_market['close'].iloc[-1],
-            'volume': post_market['volume'].sum()
-        }
-    
-    return {
-        'pre_market': pm_stats,
-        'regular_hours': rh_stats,
-        'post_market': post_stats
-    }
-
-def calculate_opening_range(data: pd.DataFrame, minutes: int = 15) -> Dict[str, float]:
-    """
-    Calculate the opening range for a given number of minutes
-    
-    Args:
-        data: DataFrame with OHLCV data
-        minutes: Number of minutes to consider for the opening range
-        
-    Returns:
-        Dictionary with high and low of the opening range
-    """
-    eastern_tz = pytz.timezone('US/Eastern')
-    
-    # Convert index to eastern time if needed
-    if isinstance(data.index[0], pd.Timestamp):
-        df = data.copy()
-        # If timezone info is missing, assume UTC and convert to Eastern
-        if df.index[0].tzinfo is None:
-            df.index = pd.to_datetime(df.index, utc=True)
-        df.index = df.index.tz_convert(eastern_tz)
-    else:
-        # If not timestamp index, just use the original data
-        df = data
-    
-    # Define market open
-    market_open = pd.Timestamp('09:30:00', tz=eastern_tz).time()
-    
-    # Find market open in the data
-    if isinstance(df.index[0], pd.Timestamp):
-        # Look for the first candle that starts at or after market open
-        market_open_candles = df[df.index.time >= market_open]
-        
-        if market_open_candles.empty:
-            # If no candles found at or after market open, use the first candle in the dataset
-            opening_range_end_time = df.index[0] + pd.Timedelta(minutes=minutes)
-            opening_range = df[df.index <= opening_range_end_time]
-        else:
-            # Get the first market open candle
-            first_candle_time = market_open_candles.index[0]
-            # Calculate end time for the opening range
-            opening_range_end_time = first_candle_time + pd.Timedelta(minutes=minutes)
-            # Filter data for the opening range
-            opening_range = df[(df.index >= first_candle_time) & (df.index <= opening_range_end_time)]
-    else:
-        # If not timestamp index, just use the first N candles
-        opening_range = df.iloc[:max(1, min(minutes, len(df)))]
-    
-    # Calculate opening range high and low
-    try:
-        if opening_range.empty:
-            # Return default values if no data is available
-            high_val = float(df['high'].iloc[0]) if not df.empty else 0.0
-            low_val = float(df['low'].iloc[0]) if not df.empty else 0.0
-        else:
-            high_val = float(opening_range['high'].max())
-            low_val = float(opening_range['low'].min())
-        
-        return {
-            'high': high_val,
-            'low': low_val
-        }
-    except (ValueError, TypeError) as e:
-        print(f"Error calculating opening range values: {e}")
-        return {
-            'high': 0.0,
-            'low': 0.0
-        }
-
-def detect_orb_breakout(data: pd.DataFrame, or_data: Dict[str, float]) -> pd.DataFrame:
-    """
-    Detect Opening Range Breakout (ORB) signals
-    
-    Args:
-        data: DataFrame with OHLCV data
-        or_data: Dictionary with opening range high and low values
-        
-    Returns:
-        DataFrame with ORB breakout signals
-    """
-    if data is None or len(data) < 2 or 'high' not in data.columns or 'low' not in data.columns:
-        return pd.DataFrame(index=data.index if data is not None else [])
-    
-    or_high = or_data.get('high', 0)
-    or_low = or_data.get('low', 0)
-    
-    # Convert to float if they're strings or other types
-    try:
-        or_high = float(or_high) if or_high is not None else 0
-        or_low = float(or_low) if or_low is not None else 0
-    except (ValueError, TypeError):
-        return pd.DataFrame(index=data.index)
-    
-    if or_high <= 0 or or_low <= 0:
-        return pd.DataFrame(index=data.index)
-    
-    # Initialize signals DataFrame
-    signals = pd.DataFrame(index=data.index)
-    signals['orb_breakout_up'] = False
-    signals['orb_breakout_down'] = False
-    
-    # Used to track if we've already identified a breakout
-    up_breakout_found = False
-    down_breakout_found = False
-    
-    eastern_tz = pytz.timezone('US/Eastern')
-    market_open_time = pd.Timestamp('09:30:00', tz=eastern_tz).time()
-    
-    # First, find the opening range end time
-    if isinstance(data.index[0], pd.Timestamp):
-        # Check if index has timezone info, if not assume UTC
-        if data.index[0].tzinfo is None:
-            df_idx = pd.DatetimeIndex(data.index).tz_localize('UTC').tz_convert(eastern_tz)
-        else:
-            df_idx = data.index.tz_convert(eastern_tz)
-        
-        # Find candles after market open
-        after_open_mask = df_idx.time >= market_open_time
-        if after_open_mask.any():
-            first_candle_after_open = df_idx[after_open_mask][0]
-            # Skip OR formation period - use Timedelta properly
-            opening_range_end_time = first_candle_after_open + pd.Timedelta(minutes=15)
-            or_formation_mask = df_idx <= opening_range_end_time
-            skip_indices = data.index[or_formation_mask]
-        else:
-            # If no candles after market open, use first 15 minutes of available data
-            opening_range_end_time = df_idx[0] + pd.Timedelta(minutes=15)
-            or_formation_mask = df_idx <= opening_range_end_time
-            skip_indices = data.index[or_formation_mask]
-    else:
-        # If not timestamp index, assume first 15 candles are the opening range
-        skip_indices = data.index[:min(15, len(data))]
-    
-    # Check each candle for breakouts, skipping the OR formation period
-    for i in range(len(data)):
-        idx = data.index[i]
-        
-        # Skip OR formation period
-        if idx in skip_indices:
-            continue
-        
-        # Check for upside breakout if not already found
-        if not up_breakout_found and data.loc[idx, 'high'] > or_high:
-            signals.loc[idx, 'orb_breakout_up'] = True
-            up_breakout_found = True
-        
-        # Check for downside breakout if not already found
-        if not down_breakout_found and data.loc[idx, 'low'] < or_low:
-            signals.loc[idx, 'orb_breakout_down'] = True
-            down_breakout_found = True
-        
-        # If both breakouts found, we can stop processing
-        if up_breakout_found and down_breakout_found:
-            break
-    
-    return signals 
-
 def generate_signals_multi_timeframe(data_dict: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
     """
     Generate trading signals using the multi-timeframe integration framework.
@@ -1579,7 +497,7 @@ def generate_signals_multi_timeframe(data_dict: Dict[str, pd.DataFrame]) -> Dict
     Args:
         data_dict: Dictionary with timeframe names as keys and OHLCV DataFrames as values
             Must contain at least three timeframes: higher (1h/15m), middle (5m), and lower (1m)
-            
+        
     Returns:
         Dictionary with signal results including recommendations and analysis
     """
@@ -1679,4 +597,665 @@ def generate_signals_multi_timeframe(data_dict: Dict[str, pd.DataFrame]) -> Dict
             "success": False,
             "error": str(e),
             "signals": pd.DataFrame()
+        }
+
+# Add a standalone generate_signals function for backwards compatibility
+def generate_signals(data):
+    """
+    Generate trading signals for a given price dataset with added paired signal information
+    
+    Args:
+        data (pd.DataFrame): DataFrame with OHLCV data
+        
+    Returns:
+        pd.DataFrame: DataFrame with signals
+    """
+    # Just call generate_standard_signals with the provided data
+    try:
+        signals = generate_standard_signals(data)
+        
+        # Generate exit signals and add them to the signals DataFrame
+        signals = add_exit_signals_to_dataframe(data, signals)
+        
+        # Add paired signal information if possible
+        try:
+            # Get paired results without modifying the signals
+            generator = PairedSignalGenerator()
+            paired_results = generator.generate_paired_signals(data)
+            
+            # Add paired entry/exit flags to the signals DataFrame
+            if 'paired_signals' in paired_results and not paired_results['paired_signals'].empty:
+                signals['paired_entry'] = False
+                signals['paired_exit'] = False
+                
+                for _, pair in paired_results['paired_signals'].iterrows():
+                    if pair['entry_time'] in signals.index:
+                        signals.loc[pair['entry_time'], 'paired_entry'] = True
+                    if pair['exit_time'] in signals.index:
+                        signals.loc[pair['exit_time'], 'paired_exit'] = True
+        except Exception as e:
+            print(f"Warning: Could not add paired signal information: {str(e)}")
+        
+        return signals
+    except Exception as e:
+        print(f"Error in generate_signals wrapper: {str(e)}")
+        traceback.print_exc()
+        return pd.DataFrame(index=data.index if data is not None else [])
+
+def add_exit_signals_to_dataframe(data, signals):
+    """
+    Generate exit signals and add them to the signals DataFrame
+    
+    Args:
+        data (pd.DataFrame): DataFrame with OHLCV data
+        signals (pd.DataFrame): DataFrame with buy/sell signals
+        
+    Returns:
+        pd.DataFrame: DataFrame with added exit signals
+    """
+    try:
+        # Initialize exit signal columns if they don't exist
+        if 'exit_buy' not in signals.columns:
+            signals['exit_buy'] = False
+        
+        if 'exit_sell' not in signals.columns:
+            signals['exit_sell'] = False
+        
+        # Initialize variables to track positions
+        in_long_position = False
+        in_short_position = False
+        entry_price = None
+        entry_idx = None
+        
+        # Track current exit reason to add to signals
+        exit_reason = None
+        
+        # ATR for exit signals
+        if 'atr' not in data.columns:
+            # Calculate ATR if not present
+            data['atr'] = calculate_atr(data)
+        
+        # Track price movements for exits
+        for i, idx in enumerate(signals.index):
+            # Get current price
+            current_price = data.loc[idx, 'close']
+            
+            # Buy signal - enter long position
+            if signals.loc[idx, 'buy_signal'] and not in_long_position and not in_short_position:
+                in_long_position = True
+                entry_price = current_price
+                entry_idx = idx
+                
+            # Sell signal - enter short position
+            elif signals.loc[idx, 'sell_signal'] and not in_short_position and not in_long_position:
+                in_short_position = True
+                entry_price = current_price
+                entry_idx = idx
+                
+            # Check for exit conditions if in a position
+            if in_long_position or in_short_position:
+                should_exit = False
+                exit_reason = None
+                
+                # Get current ATR for dynamic stops
+                current_atr = data.loc[idx, 'atr'] if 'atr' in data.columns else None
+                
+                if in_long_position:
+                    # Exit long on sell signal
+                    if signals.loc[idx, 'sell_signal']:
+                        should_exit = True
+                        exit_reason = 'reverse_signal'
+                    
+                    # Exit on stop loss (ATR-based)
+                    elif current_atr is not None:
+                        stop_level = entry_price - (1.5 * current_atr)
+                        if current_price <= stop_level:
+                            should_exit = True
+                            exit_reason = 'stop_loss'
+                    
+                    # Exit on take profit (simple fixed target - can be enhanced)
+                    elif entry_price is not None:
+                        target_level = entry_price * 1.02  # 2% profit target
+                        if current_price >= target_level:
+                            should_exit = True
+                            exit_reason = 'take_profit'
+                
+                elif in_short_position:
+                    # Exit short on buy signal
+                    if signals.loc[idx, 'buy_signal']:
+                        should_exit = True
+                        exit_reason = 'reverse_signal'
+                    
+                    # Exit on stop loss (ATR-based)
+                    elif current_atr is not None:
+                        stop_level = entry_price + (1.5 * current_atr)
+                        if current_price >= stop_level:
+                            should_exit = True
+                            exit_reason = 'stop_loss'
+                    
+                    # Exit on take profit
+                    elif entry_price is not None:
+                        target_level = entry_price * 0.98  # 2% profit target for shorts
+                        if current_price <= target_level:
+                            should_exit = True
+                            exit_reason = 'take_profit'
+                
+                # Apply exit signal if conditions met
+                if should_exit:
+                    if in_long_position:
+                        signals.loc[idx, 'exit_buy'] = True
+                        in_long_position = False
+                    elif in_short_position:
+                        signals.loc[idx, 'exit_sell'] = True
+                        in_short_position = False
+                    
+                    # Store exit reason if column exists or create it
+                    if 'exit_reason' not in signals.columns:
+                        signals['exit_reason'] = None
+                    signals.loc[idx, 'exit_reason'] = exit_reason
+                    
+                    # Reset position tracking
+                    entry_price = None
+                    entry_idx = None
+        
+        return signals
+    except Exception as e:
+        print(f"Error generating exit signals: {str(e)}")
+        traceback.print_exc()
+        return signals  # Return original signals without exits
+
+# Add the generate_signals_advanced function that's missing in the imports
+def generate_signals_advanced(data, config=None, symbol=None):
+    """
+    Generate trading signals with advanced filtering and adaptive thresholds
+    
+    Args:
+        data (pd.DataFrame): OHLCV price data
+        config (dict, optional): Configuration parameters
+        symbol (str, optional): Trading symbol for symbol-specific optimizations
+        
+    Returns:
+        dict: Dictionary with signals and metadata
+    """
+    if config is None:
+        config = {}
+    
+    # Calculate base technical indicators
+    if 'rsi' not in data.columns:
+        data['rsi'] = calculate_rsi(data)
+    
+    if 'atr' not in data.columns:
+        data['atr'] = calculate_atr(data)
+    
+    if 'macd' not in data.columns:
+        macd_data = calculate_macd(data)
+        data['macd'] = macd_data[0]
+        data['macd_signal'] = macd_data[1]
+        data['macd_hist'] = macd_data[2]
+    
+    # Generate raw signals using all available indicators
+    signals = pd.DataFrame(index=data.index)
+    signals['buy_signal'] = False
+    signals['sell_signal'] = False
+    
+    # Signal calculation logic
+    # ... [existing signal logic remains unchanged] ...
+    
+    # Use enhanced signal scoring system
+    scorer = create_signal_scorer(symbol=symbol)
+    
+    # Detect market regime
+    market_regime = scorer.detect_market_regime(data)
+    
+    # Score and validate signals
+    signal_result = score_signals(data, signals, symbol=symbol)
+    
+    # Apply dynamic thresholds
+    thresholds = signal_result['thresholds']
+    validated_signals = signal_result['signals']
+    
+    # Create final signals based on scores and thresholds
+    final_signals = pd.DataFrame(index=data.index)
+    final_signals['buy_signal'] = False
+    final_signals['sell_signal'] = False
+    final_signals['buy_score'] = 0.0
+    final_signals['sell_score'] = 0.0
+    final_signals['regime'] = market_regime.value
+    
+    # Apply scores to the signals
+    for idx in validated_signals.index:
+        if idx in final_signals.index:
+            # Check scores against thresholds
+            buy_score = signal_result['buy_score']
+            sell_score = signal_result['sell_score']
+            
+            # Set final signals based on thresholds
+            final_signals.at[idx, 'buy_score'] = buy_score
+            final_signals.at[idx, 'sell_score'] = sell_score
+            final_signals.at[idx, 'buy_signal'] = buy_score >= thresholds['buy'] and validated_signals.at[idx, 'regime_validated_buy']
+            final_signals.at[idx, 'sell_signal'] = sell_score >= thresholds['sell'] and validated_signals.at[idx, 'regime_validated_sell']
+            
+            # Handle position sizing
+            final_signals.at[idx, 'position_size'] = signal_result['position_size']
+    
+    # Apply exit strategy
+    final_signals = apply_exit_strategy(data, final_signals, symbol=symbol)
+    
+    # Return comprehensive result
+    return {
+        'signals': final_signals,
+        'raw_signals': signals,
+        'validated_signals': validated_signals,
+        'market_regime': market_regime.value,
+        'thresholds': thresholds,
+        'scores': {
+            'buy': signal_result['buy_score'], 
+            'sell': signal_result['sell_score']
+        },
+        'position_size': signal_result['position_size']
+    }
+
+# Add the missing analyze_single_day function
+def analyze_single_day(data: pd.DataFrame, symbol: str = None) -> Dict[str, Any]:
+    """
+    Analyze a single day of trading data and generate intraday signals
+    
+    Args:
+        data: DataFrame with OHLCV data for a single day
+        symbol: Trading symbol (optional)
+        
+    Returns:
+        Dictionary containing signals and analysis results
+    """
+    try:
+        print(f"Starting single day analysis with {len(data)} data points")
+        
+        # Check for sufficient data
+        if data is None or len(data) < 10:
+            print(f"Insufficient data points ({len(data) if data is not None else 0}). At least 10 points are needed for analysis.")
+            return {
+                "success": False,
+                "error": "Insufficient data for analysis",
+                "signals": pd.DataFrame()
+            }
+            
+        # Generate signals
+        signals = generate_signals(data)
+        
+        # Extract session data
+        eastern = pytz.timezone('US/Eastern')
+        session_data = {
+            'regular_hours': {
+                'open': data['open'].iloc[0] if not data.empty else None,
+                'high': data['high'].max() if not data.empty else None,
+                'low': data['low'].min() if not data.empty else None,
+                'close': data['close'].iloc[-1] if not data.empty else None,
+                'volume': data['volume'].sum() if not data.empty else None
+            }
+        }
+        
+        # Calculate opening range
+        if not data.empty and data.index.tzinfo is not None:
+            market_data = data.copy()
+            market_data.index = market_data.index.tz_convert(eastern)
+            
+            # Get morning hours (9:30 AM - 10:30 AM ET)
+            morning_mask = [idx.time() >= time(9, 30) and idx.time() <= time(10, 30) for idx in market_data.index]
+            morning_data = market_data.loc[morning_mask] if any(morning_mask) else market_data
+            
+            orb_high = morning_data['high'].max() if not morning_data.empty else None
+            orb_low = morning_data['low'].min() if not morning_data.empty else None
+            or_data = {'high': orb_high, 'low': orb_low}
+        else:
+            or_data = {'high': None, 'low': None}
+        
+        # Get signal rows
+        signal_rows = signals[(signals['buy_signal'] == True) | (signals['sell_signal'] == True)] if 'buy_signal' in signals.columns else pd.DataFrame()
+        
+        return {
+            "success": True,
+            "data": {
+                "session_data": session_data,
+                "opening_range": or_data,
+                "signals": signals,
+                "signal_rows": signal_rows,
+                "last_close": data['close'].iloc[-1] if not data.empty else None,
+                "last_data_point": data.index[-1] if not data.empty else None
+            }
+        }
+    except Exception as e:
+        print(f"Error in single day analysis: {str(e)}")
+        traceback.print_exc()
+        return {
+                "success": False,
+            "error": str(e),
+                        "signals": pd.DataFrame()
+                    }
+        
+def analyze_exit_strategy(data, position):
+    """
+    Apply SPY options exit strategy to an open position
+    
+    Args:
+        data (pd.DataFrame): OHLCV price data
+        position (dict): Position information including:
+            - type: 'long' or 'short'
+            - entry_price: Entry price
+            - entry_time: Timestamp of entry
+    
+    Returns:
+        dict: Exit strategy analysis including:
+            - action: Action to take
+            - signals: DataFrame with exit signals
+    """
+    try:
+        # Create exit strategy instance
+        exit_strategy = EnhancedExitStrategy(SPY_EXIT_CONFIG)
+        
+        # Initialize signals for entry signals (needed for the exit strategy)
+        entry_signals = pd.DataFrame(index=data.index)
+        entry_signals['buy_signal'] = False
+        entry_signals['sell_signal'] = False
+        
+        # Generate exit signals
+        exit_signals = exit_strategy.position_manager.generate_exit_signals(data, entry_signals)
+        
+        # Determine current position state
+        current_price = data['close'].iloc[-1]
+        position_type = position['type']
+        
+        # Create action recommendation
+        current_idx = data.index[-1]
+        should_exit = (position_type == 'long' and exit_signals.at[current_idx, 'exit_buy']) or \
+                      (position_type == 'short' and exit_signals.at[current_idx, 'exit_sell'])
+        
+        # Get exit reason
+        exit_reason = 'momentum_exit'
+        if should_exit:
+            if 'rsi' in data.columns and data['rsi'].iloc[-1] > 70:
+                exit_reason = 'overbought'
+            elif 'rsi' in data.columns and data['rsi'].iloc[-1] < 30:
+                exit_reason = 'oversold'
+            elif 'atr' in data.columns:
+                exit_reason = 'atr_stop'
+        
+        action = {
+            'close_percent': 100 if should_exit else 0,
+            'reason': exit_reason,
+            'adjust_stop': False,
+            'new_stop': None
+        }
+        
+        # Calculate performance metrics
+        if position['type'] == 'long':
+            pnl_pct = (current_price - position['entry_price']) / position['entry_price'] * 100
+        else:
+            pnl_pct = (position['entry_price'] - current_price) / position['entry_price'] * 100
+            
+        position_age = pd.Timestamp.now(tz=pytz.timezone('US/Eastern')) - position['entry_time']
+        position_age_minutes = position_age.total_seconds() / 60
+        
+        # Calculate time-based exit probability
+        time_decay_prob = min(position_age_minutes / 120, 0.95)  # Simple linear model
+        
+        # Calculate ATR stop level if ATR is available
+        atr_stop = None
+        if 'atr' in data.columns:
+            last_atr = data['atr'].iloc[-1]
+            if position_type == 'long':
+                atr_stop = position['entry_price'] - (1.5 * last_atr)
+            else:
+                atr_stop = position['entry_price'] + (1.5 * last_atr)
+        
+        return {
+            "success": True,
+            "action": action,
+            "signals": exit_signals,
+            "metrics": {
+                "pnl_percent": pnl_pct,
+                "position_age_minutes": position_age_minutes,
+                "exit_probability": time_decay_prob
+            },
+            "atr_stop": atr_stop
+        }
+    
+    except Exception as e:
+        print(f"Error analyzing exit strategy: {str(e)}")
+        traceback.print_exc()
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+def multi_timeframe_generate_signals_advanced(data_dict, primary_timeframe="1h", symbol=None):
+    """
+    Generate signals using advanced multi-timeframe analysis with enhanced scoring
+    
+    Args:
+        data_dict (dict): Dictionary of dataframes for different timeframes
+        primary_timeframe (str): The primary timeframe to focus on
+        symbol (str, optional): Trading symbol for symbol-specific optimizations
+        
+    Returns:
+        dict: Results containing signals, market regime, and other analysis information
+    """
+    try:
+        # Ensure we have the primary timeframe data
+        if primary_timeframe not in data_dict:
+            primary_timeframe = list(data_dict.keys())[0]
+            
+        # Get primary data
+        primary_data = data_dict[primary_timeframe]
+        
+        # Generate individual timeframe signals with enhanced scoring
+        timeframe_results = {}
+        for tf, data in data_dict.items():
+            timeframe_results[tf] = generate_signals_advanced(data, symbol=symbol)
+        
+        # Use primary timeframe as the base result
+        result = timeframe_results[primary_timeframe]
+        
+        # Add multi-timeframe alignment score
+        tf_alignment_score = calculate_timeframe_alignment(timeframe_results)
+        
+        # Combine signals from multiple timeframes
+        combined_signals = combine_timeframe_signals(timeframe_results, primary_timeframe)
+        
+        # Add alignment information to result
+        result['timeframe_alignment'] = tf_alignment_score
+        result['timeframe_results'] = timeframe_results
+        result['combined_signals'] = combined_signals
+        
+        return result
+        
+    except Exception as e:
+        print(f"Error in multi_timeframe_generate_signals_advanced: {str(e)}")
+        traceback.print_exc()
+    return {
+            "success": False,
+            "error": str(e),
+            "signals": pd.DataFrame()
+        }
+
+def calculate_timeframe_alignment(timeframe_results):
+    """
+    Calculate alignment score across timeframes
+    
+    Args:
+        timeframe_results (dict): Results from different timeframes
+        
+    Returns:
+        float: Alignment score (0-1)
+    """
+    # Skip if we don't have multiple timeframes
+    if len(timeframe_results) < 2:
+        return 1.0
+        
+    # Count timeframes that agree on bullish/bearish bias
+    bullish_count = 0
+    bearish_count = 0
+    total_count = 0
+    
+    for tf, result in timeframe_results.items():
+        buy_score = result['scores']['buy']
+        sell_score = result['scores']['sell']
+        
+        # Count as bullish if buy score exceeds sell score
+        if buy_score > sell_score:
+            bullish_count += 1
+        else:
+            bearish_count += 1
+            
+        total_count += 1
+    
+    # Calculate alignment as the ratio of the dominant bias
+    dominant_count = max(bullish_count, bearish_count)
+    alignment_score = dominant_count / total_count
+    
+    return alignment_score
+
+def combine_timeframe_signals(timeframe_results, primary_timeframe):
+    """
+    Combine signals from multiple timeframes with weighted importance
+    
+    Args:
+        timeframe_results (dict): Results from different timeframes
+        primary_timeframe (str): Primary timeframe to prioritize
+        
+    Returns:
+        pd.DataFrame: Combined signals
+    """
+    # If we only have one timeframe, return its signals
+    if len(timeframe_results) < 2:
+        return timeframe_results[list(timeframe_results.keys())[0]]['signals']
+    
+    # Create empty DataFrame to hold combined signals
+    # Use primary timeframe's index
+    primary_signals = timeframe_results[primary_timeframe]['signals']
+    combined = pd.DataFrame(index=primary_signals.index)
+    combined['buy_signal'] = False
+    combined['sell_signal'] = False
+    combined['buy_score'] = 0.0
+    combined['sell_score'] = 0.0
+    combined['regime'] = primary_signals['regime'] if 'regime' in primary_signals.columns else 'unknown'
+    
+    # Timeframe weights - prioritize lower timeframes
+    # These determine how much influence each timeframe has
+    timeframe_weights = {
+        '1m': 0.5,   # 1-minute: lowest weight due to noise
+        '5m': 0.6,   # 5-minute
+        '15m': 0.7,  # 15-minute
+        '30m': 0.8,  # 30-minute
+        '1h': 0.9,   # 1-hour
+        '4h': 1.0,   # 4-hour: highest weight for intraday
+        '1d': 0.95   # Daily: slightly less weight for day trading
+    }
+    
+    # Keep track of the sum of weights for normalization
+    total_buy_weight = 0
+    total_sell_weight = 0
+    
+    # For each timeframe, add its weighted contribution
+    for tf, result in timeframe_results.items():
+        signals = result['signals']
+        scores = result['scores']
+        
+        # Skip if signals don't align with primary timeframe index
+        if not signals.index.equals(combined.index):
+            continue
+            
+        # Get weight for this timeframe
+        weight = timeframe_weights.get(tf, 0.7)  # Default weight if not specified
+        
+        # Add weighted score to combined
+        combined['buy_score'] += weight * scores['buy']
+        combined['sell_score'] += weight * scores['sell']
+        
+        # Update total weights
+        total_buy_weight += weight
+        total_sell_weight += weight
+    
+    # Normalize scores by total weights
+    if total_buy_weight > 0:
+        combined['buy_score'] = combined['buy_score'] / total_buy_weight
+    
+    if total_sell_weight > 0:
+        combined['sell_score'] = combined['sell_score'] / total_sell_weight
+    
+    # Set signals based on normalized scores
+    # Use dynamic thresholds from primary timeframe
+    thresholds = timeframe_results[primary_timeframe]['thresholds']
+    
+    # Apply thresholds to generate signals
+    combined['buy_signal'] = combined['buy_score'] >= thresholds['buy']
+    combined['sell_signal'] = combined['sell_score'] >= thresholds['sell']
+    
+    # Use position sizing from primary timeframe
+    if 'position_size' in primary_signals.columns:
+        combined['position_size'] = primary_signals['position_size']
+    
+    return combined
+
+def generate_signals_advanced_wrapper(data_dict, primary_timeframe):
+    """
+    Generate signals using advanced multi-timeframe analysis (backwards compatibility wrapper)
+    
+    Args:
+        data_dict (dict): Dictionary of dataframes for different timeframes
+        primary_timeframe (str): The primary timeframe to focus on
+            
+    Returns:
+        dict: Results containing signals, market regime, and other analysis information
+    """
+    try:
+        # Check if we have a dictionary of timeframes
+        if isinstance(data_dict, dict) and len(data_dict) > 0:
+            # Use multi-timeframe version
+            return multi_timeframe_generate_signals_advanced(data_dict, primary_timeframe)
+        else:
+            # Single timeframe case - assume data_dict is actually a DataFrame
+            return generate_signals_advanced(data_dict)
+    except Exception as e:
+        print(f"Error in generate_signals_advanced wrapper: {str(e)}")
+        traceback.print_exc()
+        return {
+            "success": False,
+            "error": str(e),
+            "signals": pd.DataFrame()
+        }
+    
+# Restore original function name for backward compatibility
+generate_signals_advanced = generate_signals_advanced_wrapper
+
+# Add functionality to analyze and generate paired signals
+def generate_signals_with_pairs(data):
+    """
+    Generate signals with paired entry-exit information
+    
+    Args:
+        data (pd.DataFrame): OHLCV price data
+        
+    Returns:
+        dict: Dictionary containing signals and paired signal information
+    """
+    try:
+        # Create paired signal generator
+        generator = PairedSignalGenerator()
+        
+        # Generate paired signals
+        paired_results = generator.generate_paired_signals(data)
+        
+        # Return the combined results
+        return paired_results
+    except Exception as e:
+        print(f"Error generating paired signals: {str(e)}")
+        traceback.print_exc()
+        
+        # Fallback to standard signals
+        signals = generate_signals(data)
+        return {
+            'signal_df': signals,
+            'raw_signals': signals,
+            'paired_signals': pd.DataFrame(),
+            'metrics': {}
         } 

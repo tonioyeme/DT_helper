@@ -983,16 +983,36 @@ class MultiTimeFrameAnalyzer:
                 if close_price:
                     recommendation['entry_price'] = close_price
                     
+                    # Get ATR for dynamic calculations if available
+                    atr_value = None
+                    if 'atr' in orig_tf_data.columns:
+                        atr_value = orig_tf_data.iloc[nearest_idx]['atr']
+                    
+                    # Get VIX level
+                    vix_level = self._get_vix_level()
+                    
                     # Use target and stop from signals if available, otherwise calculate
                     if 'target_price' in tf_data['signals'] and not pd.isna(tf_data['signals']['target_price']):
                         recommendation['target_price'] = tf_data['signals']['target_price']
                     elif alignment_result['dominant_signal'] == "buy":
-                        recommendation['target_price'] = close_price * 1.03  # 3% gain
+                        # Use dynamic profit target
+                        target_pct = self.dynamic_profit_target(atr_value, vix_level, close_price)
+                        recommendation['target_price'] = close_price * (1 + target_pct)
+                    elif alignment_result['dominant_signal'] == "sell":
+                        # Use dynamic profit target for short positions
+                        target_pct = self.dynamic_profit_target(atr_value, vix_level, close_price)
+                        recommendation['target_price'] = close_price * (1 - target_pct)
                         
                     if 'stop_loss' in tf_data['signals'] and not pd.isna(tf_data['signals']['stop_loss']):
                         recommendation['stop_loss'] = tf_data['signals']['stop_loss']
                     elif alignment_result['dominant_signal'] == "buy":
-                        recommendation['stop_loss'] = close_price * 0.99  # 1% loss
+                        # Use dynamic stop loss based on volatility
+                        stop_pct = self.dynamic_stop_loss(atr_value, vix_level, close_price)
+                        recommendation['stop_loss'] = close_price * (1 - stop_pct)
+                    elif alignment_result['dominant_signal'] == "sell":
+                        # Use dynamic stop loss for short positions
+                        stop_pct = self.dynamic_stop_loss(atr_value, vix_level, close_price)
+                        recommendation['stop_loss'] = close_price * (1 + stop_pct)
                         
                     # Calculate risk-reward ratio if we have both target and stop
                     if recommendation['target_price'] and recommendation['stop_loss'] and recommendation['entry_price']:
@@ -1007,3 +1027,85 @@ class MultiTimeFrameAnalyzer:
                             recommendation['risk_reward'] = round(reward / risk, 2)
         
         return recommendation 
+        
+    def _get_vix_level(self):
+        """
+        Get current VIX level, either from data or default value
+        
+        Returns:
+            float: VIX level (default 20.0 if not available)
+        """
+        try:
+            import streamlit as st
+            if hasattr(st, 'session_state') and hasattr(st.session_state, 'vix_level'):
+                return st.session_state.vix_level
+        except ImportError:
+            pass
+        
+        return 20.0  # Default mid-range value
+        
+    def dynamic_profit_target(self, atr_value=None, vix_level=None, price=None):
+        """
+        Calculate dynamic profit target based on ATR and VIX
+        
+        Args:
+            atr_value (float): Current ATR value (optional)
+            vix_level (float): Current VIX level (optional)
+            price (float): Current price (optional)
+            
+        Returns:
+            float: Profit target as percentage of price
+        """
+        base_target = 0.006  # 0.6% base target
+        
+        # If we have ATR, adjust target based on volatility
+        if atr_value is not None and price is not None and price > 0:
+            atr_pct = atr_value / price
+            base_target = max(base_target, atr_pct * 0.5)  # Target at least 50% of ATR
+        
+        # Adjust based on VIX level
+        if vix_level is None:
+            vix_level = self._get_vix_level()
+            
+        # Expand targets in high volatility
+        if vix_level > 25:
+            return base_target * 2.5  # 1.5% in high vol
+        elif vix_level > 20:
+            return base_target * 1.8  # 1.08% in elevated vol
+        elif vix_level < 15:
+            return base_target * 0.7  # 0.42% in low vol
+        else:
+            return base_target * 1.2  # 0.72% in normal vol
+    
+    def dynamic_stop_loss(self, atr_value=None, vix_level=None, price=None):
+        """
+        Calculate dynamic stop loss based on ATR and VIX
+        
+        Args:
+            atr_value (float): Current ATR value (optional)
+            vix_level (float): Current VIX level (optional)
+            price (float): Current price (optional)
+            
+        Returns:
+            float: Stop loss as percentage of price
+        """
+        base_stop = 0.004  # 0.4% base stop
+        
+        # If we have ATR, adjust stop based on volatility
+        if atr_value is not None and price is not None and price > 0:
+            atr_pct = atr_value / price
+            base_stop = max(base_stop, atr_pct * 0.75)  # Stop at 75% of ATR
+        
+        # Adjust based on VIX level
+        if vix_level is None:
+            vix_level = self._get_vix_level()
+            
+        # Expand stops in high volatility
+        if vix_level > 25:
+            return base_stop * 1.8  # Wider stops in high vol
+        elif vix_level > 20:
+            return base_stop * 1.4  # Wider stops in elevated vol
+        elif vix_level < 15:
+            return base_stop * 0.9  # Tighter stops in low vol
+        else:
+            return base_stop * 1.0  # Normal stops otherwise 

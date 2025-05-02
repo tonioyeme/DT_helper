@@ -18,6 +18,18 @@ from app.indicators import (
     calculate_atr
 )
 
+# Import position manager
+from app.signals.position_manager import (
+    get_position_manager, calculate_exit_timing, get_vix_level, 
+    SPY_CONFIG as POSITION_CONFIG
+)
+
+# Import position manager processing
+from app.signals.processing import process_signals_with_position_manager
+
+# Import the new exit strategy
+from app.signals.exit_signals import apply_exit_strategy, EnhancedExitStrategy, SPY_EXIT_CONFIG
+
 try:
     from app.config.instruments.spy import SPY_CONFIG
     print("Successfully loaded SPY configuration in spy_strategy.py")
@@ -41,6 +53,159 @@ except ImportError:
             'confirmation_required': False
         }
     }
+
+def apply_exit_priority_flags(signals: pd.DataFrame, data: pd.DataFrame = None) -> pd.DataFrame:
+    """
+    Add exit priority flags to ensure positions are exited before entering opposite positions
+    Uses enhanced sequential position manager for SPY-optimized execution
+    
+    Args:
+        signals: DataFrame with buy and sell signals
+        data: DataFrame with OHLCV data for execution optimization
+        
+    Returns:
+        DataFrame with exit priority flags added
+    """
+    # Create a copy to avoid modifying original
+    processed_signals = signals.copy()
+    
+    # Initialize exit flag columns if they don't exist
+    if 'exit_buy' not in processed_signals.columns:
+        processed_signals['exit_buy'] = False
+    if 'exit_sell' not in processed_signals.columns:
+        processed_signals['exit_sell'] = False
+    
+    # If we don't have any signals, just return
+    if len(processed_signals) == 0:
+        return processed_signals
+    
+    # Get position manager and reset it for clean processing
+    position_manager = get_position_manager(reset=True)
+    
+    # Process through every signal in chronological order to build proper signal sequence
+    current_position = None
+    pending_exit = False
+    
+    # Track processed signals in a new DataFrame to ensure chronological order
+    chronological_signals = []
+    
+    # First pass to collect all raw signals
+    for idx, row in processed_signals.iterrows():
+        # Extract price
+        price = row.get('close', None) if 'close' in row else row.get('signal_price', None)
+        
+        # Skip if we don't have price data
+        if price is None:
+            continue
+            
+        # Default signal is neutral
+        signal = 'neutral'
+        
+        # Determine signal type
+        if row.get('buy_signal', False):
+            signal = 'buy'
+        elif row.get('sell_signal', False):
+            signal = 'sell'
+            
+        # Process the signal through position manager for sequential exit-entry enforcement
+        result = position_manager.process_signal(signal, data, price, idx)
+        
+        # Track key state
+        current_position = position_manager.current_position
+        pending_exit = position_manager.pending_exit
+        
+        # Record this chronological signal with extra metadata about position state
+        signal_record = {
+            'index': idx,
+            'raw_signal': signal,
+            'filtered_signal': signal if result['accepted'] else 'neutral',
+            'price': price,
+            'exit_required': pending_exit,
+            'current_position': current_position.direction if current_position else None,
+            'reason': result['reason']
+        }
+        
+        chronological_signals.append(signal_record)
+    
+    # Build the processed signals with forced exit-before-entry logic
+    for i, record in enumerate(chronological_signals):
+        idx = record['index']
+        
+        # Handle exit flags - mark them BEFORE new entries of opposite direction
+        if record['exit_required'] and record['current_position']:
+            pos_type = record['current_position']
+            # Add exit flag
+            if pos_type == 'buy':
+                processed_signals.loc[idx, 'exit_buy'] = True
+            elif pos_type == 'sell':
+                processed_signals.loc[idx, 'exit_sell'] = True
+        
+        # Update the original row's filtered signals
+        if record['filtered_signal'] == 'buy':
+            processed_signals.loc[idx, 'filtered_buy_signal'] = True
+            processed_signals.loc[idx, 'filtered_sell_signal'] = False
+        elif record['filtered_signal'] == 'sell':
+            processed_signals.loc[idx, 'filtered_buy_signal'] = False
+            processed_signals.loc[idx, 'filtered_sell_signal'] = True
+        else:
+            processed_signals.loc[idx, 'filtered_buy_signal'] = False
+            processed_signals.loc[idx, 'filtered_sell_signal'] = False
+            
+    return processed_signals
+
+def apply_volatility_adjusted_timing(signals: pd.DataFrame, data: pd.DataFrame) -> pd.DataFrame:
+    """
+    Apply volatility-adjusted timing for signal execution with SPY-specific optimizations
+    
+    Args:
+        signals: DataFrame with signals
+        data: DataFrame with OHLCV data for volatility calculation
+        
+    Returns:
+        DataFrame with volatility-adjusted timing
+    """
+    # Calculate implied volatility from recent price data if available
+    if data is not None and len(data) >= 20:
+        try:
+            # Calculate log returns
+            log_returns = np.log(data['close'] / data['close'].shift(1)).iloc[-20:]
+            
+            # Calculate annualized volatility
+            realized_vol = log_returns.std() * np.sqrt(252) * 100
+            
+            # Convert to implied volatility (typically 10% higher than realized)
+            vix = realized_vol * 1.1
+        except Exception:
+            # Fall back to global VIX level if calculation fails
+            vix = get_vix_level()
+    else:
+        # Use global VIX level if no price data available
+        vix = get_vix_level()
+    
+    # Calculate dynamic timing based on VIX
+    execution_delay = calculate_exit_timing(vix)
+    
+    # Add delay information to signals
+    signals['exit_delay'] = execution_delay
+    signals['implied_volatility'] = vix
+    
+    # Add emergency exit flag for end-of-day positions
+    signals['emergency_exit'] = False
+    
+    # Set emergency exit flag for positions near market close
+    if isinstance(signals.index[0], pd.Timestamp):
+        # Convert to Eastern timezone if needed
+        if signals.index[0].tzinfo is not None:
+            eastern_tz = pytz.timezone('US/Eastern')
+            times = signals.index.tz_convert(eastern_tz).strftime('%H:%M')
+        else:
+            times = signals.index.strftime('%H:%M')
+        
+        # Flag positions near market close for emergency exit
+        emergency_time = POSITION_CONFIG['emergency_clear_time']
+        signals['emergency_exit'] = [t >= emergency_time for t in times]
+    
+    return signals
 
 def analyze_spy_day_trading(data: pd.DataFrame) -> Dict[str, Any]:
     """
@@ -360,8 +525,14 @@ def analyze_spy_day_trading(data: pd.DataFrame) -> Dict[str, Any]:
                 signals.loc[idx, 'target_price'] = df.loc[idx, 'close'] - (atr_value * atr_target_mult * strength)
                 signals.loc[idx, 'stop_loss'] = df.loc[idx, 'close'] + (atr_value * atr_stop_mult)
         
-        # Get only rows with signals
+        # Get only rows with signals for statistics
         signal_rows = signals[(signals['buy_signal'] == True) | (signals['sell_signal'] == True)]
+        
+        # Apply the new exit strategy
+        signals = apply_exit_strategy(df, signals)
+        
+        # Apply volatility-adjusted timing
+        signals = apply_volatility_adjusted_timing(signals, df)
         
         # Create result dictionary
         result = {
@@ -384,7 +555,15 @@ def analyze_spy_day_trading(data: pd.DataFrame) -> Dict[str, Any]:
             }
         }
         
-        print(f"SPY analysis complete: {signal_rows['buy_signal'].sum()} buy signals, {signal_rows['sell_signal'].sum()} sell signals")
+        # Output signal statistics
+        buy_signals_count = signals['filtered_buy_signal'].sum() if 'filtered_buy_signal' in signals.columns else signals['buy_signal'].sum()
+        sell_signals_count = signals['filtered_sell_signal'].sum() if 'filtered_sell_signal' in signals.columns else signals['sell_signal'].sum()
+        exit_buy_count = signals['exit_buy'].sum() if 'exit_buy' in signals.columns else 0
+        exit_sell_count = signals['exit_sell'].sum() if 'exit_sell' in signals.columns else 0
+        
+        print(f"SPY analysis complete: {buy_signals_count} buy signals, {sell_signals_count} sell signals")
+        print(f"Exit signals: {exit_buy_count} exit buys, {exit_sell_count} exit sells")
+        
         return result
         
     except Exception as e:
@@ -418,89 +597,84 @@ def render_spy_signals(results: Dict[str, Any], symbol: str = "SPY"):
     
     data = results.get("data", {})
     signals = data.get("signals", pd.DataFrame())
-    signal_rows = data.get("signal_rows", pd.DataFrame())
     
-    # Format timestamps and signal details
-    if not signal_rows.empty:
-        formatted_signals = []
+    # Instead of using only signal_rows, use the full signals DataFrame with both entries and exits
+    all_signals = []
+    
+    # Track the current position for sequential ordering validation
+    current_position = None
+    
+    # Process entry signals (buy/sell)
+    for idx, row in signals.iterrows():
+        price = row.get('close', 0)
         
-        for idx, row in signal_rows.iterrows():
-            # Format timestamp in Eastern Time
-            if hasattr(idx, 'tz_convert'):
-                eastern_tz = pytz.timezone('US/Eastern')
-                # Convert to Eastern time and format correctly
-                timestamp = idx.tz_convert(eastern_tz).strftime("%Y-%m-%d %H:%M:%S")
-            else:
-                timestamp = str(idx)
+        # Check if this is an entry signal
+        if row.get('filtered_buy_signal', False) or row.get('filtered_sell_signal', False):
+            signal_type = 'BUY' if row.get('filtered_buy_signal', False) else 'SELL'
             
-            # Double-check timestamp is not in the future
-            if isinstance(idx, pd.Timestamp):
-                now = pd.Timestamp.now(tz='UTC')
-                if idx > now:
-                    # If timestamp is in the future, use current date with the time from the index
-                    current_date = datetime.now().strftime("%Y-%m-%d")
-                    if hasattr(idx, 'tz_convert'):
-                        time_part = idx.tz_convert(eastern_tz).strftime("%H:%M:%S")
-                    else:
-                        time_part = idx.strftime("%H:%M:%S")
-                    timestamp = f"{current_date} {time_part}"
+            # Verify this doesn't violate sequential ordering
+            if current_position is not None and current_position != 'neutral' and signal_type != current_position:
+                # If signals aren't properly sequenced, we need an exit first
+                all_signals.append({
+                    'time': idx,
+                    'signal_type': f'EXIT_{current_position}',
+                    'price': price,
+                    'explanation': 'Forced exit to maintain sequential ordering'
+                })
             
-            # Determine signal type
-            signal_type = "BUY" if row.get('buy_signal', False) else "SELL" if row.get('sell_signal', False) else "NEUTRAL"
+            # Add the entry signal
+            all_signals.append({
+                'time': idx,
+                'signal_type': signal_type,
+                'price': price,
+                'explanation': row.get('signal_explanation', f'{signal_type} signal') 
+            })
             
-            # Get values safely with None checks
-            signal_price = row.get('signal_price')
-            target_price = row.get('target_price')
-            stop_loss = row.get('stop_loss')
-            
-            # Calculate risk-reward ratio with thorough None/zero checks
-            risk_reward = None
-            if signal_type == "BUY" and signal_price is not None and target_price is not None and stop_loss is not None:
-                if signal_price > 0 and target_price > 0 and stop_loss > 0:
-                    risk = signal_price - stop_loss
-                    reward = target_price - signal_price
-                    if risk > 0:
-                        risk_reward = reward / risk
-            elif signal_type == "SELL" and signal_price is not None and target_price is not None and stop_loss is not None:
-                if signal_price > 0 and target_price > 0 and stop_loss > 0:
-                    risk = stop_loss - signal_price
-                    reward = signal_price - target_price
-                    if risk > 0:
-                        risk_reward = reward / risk
-            
-            formatted_signal = {
-                "timestamp": timestamp,
-                "type": signal_type,
-                "price": signal_price if signal_price is not None else 0,
-                "strength": row.get('signal_strength', 0),
-                "score": row.get('buy_score' if signal_type == "BUY" else 'sell_score', 0),
-                "target": target_price,
-                "stop_loss": stop_loss,
-                "risk_reward": risk_reward
-            }
-            
-            formatted_signals.append(formatted_signal)
+            # Update current position
+            current_position = signal_type
         
-        return {
-            "success": True,
-            "signals": formatted_signals,
-            "counts": {
-                "buy": signal_rows['buy_signal'].sum(),
-                "sell": signal_rows['sell_signal'].sum(),
-                "total": len(signal_rows)
-            },
-            "last_close": data.get("last_close", None),
-            "last_time": data.get("last_data_point", None)
+        # Check if this is an exit signal
+        if row.get('exit_buy', False) or row.get('exit_sell', False):
+            exit_type = 'BUY' if row.get('exit_buy', False) else 'SELL'
+            
+            all_signals.append({
+                'time': idx,
+                'signal_type': f'EXIT_{exit_type}',
+                'price': price,
+                'explanation': 'Sequential exit before new entry'
+            })
+            
+            # Update current position to neutral after exit
+            current_position = 'neutral'
+    
+    # Sort signals by time
+    all_signals.sort(key=lambda x: x['time'])
+    
+    # Build signal rows for UI display
+    signal_rows = []
+    
+    for signal in all_signals:
+        formatted_time = signal['time']
+        if hasattr(formatted_time, 'strftime'):
+            formatted_time = formatted_time.strftime('%Y-%m-%d %H:%M:%S')
+        
+        signal_rows.append({
+            'time': formatted_time,
+            'signal': signal['signal_type'],
+            'price': f"${signal['price']:.2f}",
+            'explanation': signal['explanation']
+        })
+    
+    # Additional processing for UI rendering
+    ui_data = {
+        "symbol": symbol,
+        "signals": pd.DataFrame(signal_rows),
+        "summary": {
+            "total_signals": len(signal_rows),
+            "buy_signals": len([s for s in all_signals if s['signal_type'] == 'BUY']),
+            "sell_signals": len([s for s in all_signals if s['signal_type'] == 'SELL']),
+            "exit_signals": len([s for s in all_signals if 'EXIT' in s['signal_type']])
         }
-    else:
-        return {
-            "success": True,
-            "signals": [],
-            "counts": {
-                "buy": 0,
-                "sell": 0,
-                "total": 0
-            },
-            "last_close": data.get("last_close", None),
-            "last_time": data.get("last_data_point", None)
-        } 
+    }
+    
+    return ui_data 

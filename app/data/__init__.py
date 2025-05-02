@@ -1,4 +1,4 @@
-from app.data.loader import (
+from data.loader import (
     load_market_data,
     load_sample_data,
     load_alpaca_data,
@@ -13,3 +13,7 @@ __all__ = [
     'load_tradingview_data',
     'init_alpaca_client'
 ] 
+
+# Make the data directory a Python package
+
+# Data package 

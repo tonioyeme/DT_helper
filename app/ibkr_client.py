@@ -1,0 +1,999 @@
+try:
+    from app.asyncio_patch import ensure_event_loop, with_event_loop, run_in_background, get_background_results
+except ImportError:
+    # Try direct import when running as a module
+    from asyncio_patch import ensure_event_loop, with_event_loop, run_in_background, get_background_results
+
+from ib_insync import *
+import nest_asyncio
+import threading
+import logging
+import time
+import pandas as pd
+import streamlit as st
+from datetime import datetime, timedelta
+import asyncio
+import numpy as np
+from collections import deque
+from typing import Dict, List, Optional, Tuple, Any, Callable
+
+# Configure logging
+logger = logging.getLogger(__name__)
+
+def ensure_event_loop():
+    """Ensure there is an event loop available in the current thread"""
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            logger.warning("Event loop was closed. Creating a new one.")
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        return loop
+    except RuntimeError:
+        logger.info("No event loop in current thread. Creating a new one.")
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        return loop
+
+# Initialize event loop before importing ib_insync internals
+ensure_event_loop()
+
+# Apply nest_asyncio to allow nested event loops
+nest_asyncio.apply()
+
+# Patch asyncio to work better with Streamlit
+util.patchAsyncio()
+
+class IBKRClient:
+    """
+    Interactive Brokers client for real-time market data streaming
+    using the ib_insync library.
+    """
+    @run_in_background
+    def connection_monitor(self):
+        """
+        Monitor the IB connection and attempt to reconnect if needed
+        This runs in the background and doesn't access session_state
+        """
+        while True:
+            try:
+                if not self.ib.isConnected():
+                    logger.warning("IB connection lost, attempting to reconnect...")
+                    self.connected = False
+                    self.connect()
+                # Use util.sleep instead of time.sleep for better compatibility 
+                util.sleep(5)  # Check every 5 seconds
+            except Exception as e:
+                logger.error(f"Error in connection monitor: {str(e)}")
+                util.sleep(5)
+
+    async def connection_monitor_async(self):
+        """
+        Async version of connection monitor
+        """
+        while True:
+            try:
+                if not self.ib.isConnected():
+                    logger.warning("IB connection lost, attempting to reconnect...")
+                    self.connected = False
+                    await self.connect_async()
+                await asyncio.sleep(5)  # Check every 5 seconds
+            except Exception as e:
+                logger.error(f"Error in connection monitor: {str(e)}")
+                await asyncio.sleep(5)
+
+    def __init__(self, host='127.0.0.1', port=4001, client_id=1, timeout=20):
+        """
+        Initialize the IBKR client
+        
+        Args:
+            host (str): IBKR TWS/Gateway host address
+            port (int): IBKR TWS/Gateway port (default: 4001 for IB Gateway, 7496 for TWS)
+            client_id (int): Client ID for IB connection
+            timeout (int): Timeout in seconds for connection attempts
+        """
+        # Ensure event loop exists
+        loop = ensure_event_loop()
+        self.ib = IB()
+        self.host = host
+        self.port = port
+        self.client_id = client_id
+        self.timeout = timeout
+        self.connected = False
+        self.data_streams = {}
+        self.history_data = {}
+        self.lock = threading.Lock()
+        self.ticker_callbacks = {}
+        self.last_1m_bar = {}
+        self.last_volumes = {}
+        self.last_prices = {}
+        self.last_reconnect_attempt = None
+        self.reconnect_interval = 10  # seconds between reconnection attempts
+        
+        # Thread-safe containers for ticker updates
+        self.ticker_data_updates = {}
+        self.pending_updates = False
+        
+        # Add handlers for specific event types
+        # Commented out because marketDataTypeEvent is not available in the current ib_insync version
+        # self.ib.marketDataTypeEvent += self.on_market_data_type
+    
+    def on_market_data_type(self, reqId, marketDataType):
+        """
+        Handler for market data type events
+        
+        Args:
+            reqId (int): Request ID
+            marketDataType (int): Market data type (1=Live, 2=Frozen, 3=Delayed, 4=Delayed Frozen)
+        """
+        logger.info(f"Market Data Type: {marketDataType} (1=Live, 2=Frozen, 3=Delayed, 4=Delayed Frozen)")
+        # Store in session state for monitoring
+        if 'market_data_type' not in st.session_state:
+            st.session_state.market_data_type = {}
+        st.session_state.market_data_type[reqId] = marketDataType
+
+    async def connect_async(self):
+        """
+        Async version of connect method for use with asyncio
+        """
+        try:
+            logger.info(f"Connecting to IBKR at {self.host}:{self.port} (client ID: {self.client_id}) [ASYNC]")
+            
+            # Ensure we have a valid event loop
+            loop = ensure_event_loop()
+            
+            # Ensure we have an IB instance
+            if self.ib is None:
+                self.ib = IB()
+                logger.info("Created new IB instance")
+            
+            # Connect asynchronously if not already connected
+            if not self.ib.isConnected():
+                logger.info("Connecting to IBKR asynchronously...")
+                await self.ib.connectAsync(
+                    self.host, 
+                    self.port, 
+                    clientId=self.client_id,
+                    timeout=self.timeout
+                )
+                logger.info("Connected to IBKR [ASYNC]")
+                
+                # Set connected flag
+                self.connected = self.ib.isConnected()
+                
+                # Try to handle time sync
+                await asyncio.to_thread(self.handle_time_offset)
+                    
+                # Try to set market data type to LIVE
+                try:
+                    await asyncio.to_thread(self.ib.reqMarketDataType, 1)
+                    logger.info("Set market data type to LIVE [ASYNC]")
+                except Exception as e:
+                    logger.warning(f"Could not set market data type: {str(e)}")
+                
+                return self.connected
+            else:
+                logger.info("Already connected to IBKR")
+                return True
+                
+        except Exception as e:
+            logger.error(f"Error in async connect: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            self.connected = False
+            raise e
+            
+    def connect(self):
+        """Connect to IBKR TWS/Gateway"""
+        try:
+            logger.info(f"Connecting to IBKR at {self.host}:{self.port} (client ID: {self.client_id})")
+            
+            # Ensure event loop
+            loop = ensure_event_loop()
+            
+            # Create a new IB object if needed
+            if self.ib is None:
+                self.ib = IB()
+                logger.info("Created new IB instance")
+            
+            # Connect to IBKR API
+            if not self.ib.isConnected():
+                logger.info("Connecting to IBKR...")
+                self.ib.connect(
+                    self.host, 
+                    self.port, 
+                    clientId=self.client_id,
+                    timeout=self.timeout
+                )
+                logger.info(f"Connected successfully, isConnected={self.ib.isConnected()}")
+            
+            # Check if connected
+            self.connected = self.ib.isConnected()
+            logger.info(f"Final connection status: {self.connected}")
+            
+            if self.connected:
+                # Synchronize time with server to prevent time offset issues
+                self.handle_time_offset()
+                
+                # Request LIVE market data type (1 = live, 2 = frozen, 3 = delayed, 4 = delayed frozen)
+                # First try LIVE, then fall back to DELAYED if needed
+                try:
+                    self.ib.reqMarketDataType(1)
+                    logger.info("Requested LIVE market data type (1)")
+                except Exception as e:
+                    logger.warning(f"Error requesting LIVE market data: {str(e)}")
+                    try:
+                        # Fall back to delayed data
+                        self.ib.reqMarketDataType(3)
+                        logger.info("Requested DELAYED market data type (3)")
+                    except Exception as e2:
+                        logger.error(f"Error requesting DELAYED market data: {str(e2)}")
+                
+                # Get account information
+                try:
+                    self.ib.reqAccountSummary()
+                    logger.info("Requested account summary")
+                except Exception as e:
+                    logger.warning(f"Error requesting account summary: {str(e)}")
+                
+                # Start a background thread to monitor the connection
+                if not hasattr(self, 'monitor_thread') or not self.monitor_thread.is_alive():
+                    self.monitor_thread = threading.Thread(target=self.connection_monitor)
+                    self.monitor_thread.daemon = True
+                    self.monitor_thread.start()
+                    logger.info("Started connection monitor thread")
+            
+            return self.connected
+        except Exception as e:
+            logger.error(f"Error in connect: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            self.connected = False
+            return False
+                
+    def disconnect(self):
+        """Disconnect from IB Gateway"""
+        if self.connected:
+            logger.info("Disconnecting from IB Gateway")
+            self.ib.disconnect()
+            self.connected = False
+            self.data_streams = {}
+    
+    def ensure_connected(self):
+        """Ensure connection is active, reconnect if needed"""
+        try:
+            if not self.connected or not self.ib.isConnected():
+                current_time = time.time()
+                
+                # Limit reconnection attempts frequency
+                if (self.last_reconnect_attempt is None or 
+                    (current_time - self.last_reconnect_attempt > self.reconnect_interval)):
+                    
+                    logger.warning("IB Gateway connection lost, attempting to reconnect...")
+                    self.last_reconnect_attempt = current_time
+                    self.connected = False
+                    
+                    # Try to connect with retries
+                    max_retries = 3
+                    for attempt in range(max_retries):
+                        try:
+                            if self.connect():
+                                logger.info("Successfully reconnected to IB Gateway")
+                                return True
+                            util.sleep(2)  # Wait between retries
+                        except Exception as e:
+                            logger.error(f"Reconnection attempt {attempt + 1} failed: {str(e)}")
+                            if attempt < max_retries - 1:
+                                util.sleep(2)
+                    
+                    logger.error("Failed to reconnect after multiple attempts")
+                    return False
+                else:
+                    logger.debug("Waiting before reconnection attempt")
+                    return False
+            return True
+        except Exception as e:
+            logger.error(f"Error in ensure_connected: {str(e)}")
+            return False
+    
+    def test_market_data(self, symbol="SPY", exchange="SMART", currency="USD"):
+        """
+        Test market data connection by requesting a snapshot
+        
+        Args:
+            symbol (str): Trading symbol
+            exchange (str): Exchange
+            currency (str): Currency
+            
+        Returns:
+            dict: Market data snapshot or None if failed
+        """
+        try:
+            logger.info(f"Testing market data for {symbol}")
+            
+            # Ensure connected
+            if not self.connected:
+                logger.info("Not connected, trying to connect")
+                self.connect()
+            
+            if not self.connected:
+                logger.info("Still not connected after connection attempt")
+                return None
+            
+            # Create a contract
+            contract = Stock(symbol, exchange, currency)
+            logger.info(f"Created test contract: {contract}")
+            
+            # Request market data type 1 (live)
+            self.ib.reqMarketDataType(1)  
+            
+            # Request a snapshot with generic tick types
+            # 100=Option Volume, 101=Option Open Interest, 105=Historical Volatility
+            # 106=Option Implied Volatility, 165=Misc. Stats, 221=Mark Price, 225=Auction values, 233=RTVolume
+            # 236=Inventory, 258=RTHistVol, 411=Realized Volatility
+            generic_tick_list = '100,101,105,106,165,221,225,233,236,258,411'
+            
+            ticker = self.ib.reqMktData(contract, genericTickList=generic_tick_list, snapshot=False, regulatorySnapshot=False)
+            logger.info(f"Waiting for market data for {symbol}...")
+            
+            # Wait longer for data to arrive (5 seconds instead of 3)
+            for i in range(10):  # Try for up to 10 seconds
+                self.ib.sleep(1)  # Wait in 1-second increments
+                if ticker.last or ticker.bid or ticker.ask:
+                    logger.info(f"Received market data after {i+1} seconds")
+                    break
+            
+            # Check if we got data
+            snapshot = {
+                'symbol': symbol,
+                'last': ticker.last,
+                'bid': ticker.bid,
+                'ask': ticker.ask,
+                'volume': ticker.volume,
+                'market_price': ticker.marketPrice(),
+                'model_price': ticker.modelPrice() if hasattr(ticker, 'modelPrice') else None
+            }
+            
+            logger.info(f"Market data test results: {snapshot}")
+            
+            # Cancel the market data request
+            self.ib.cancelMktData(contract)
+            
+            return snapshot
+        except Exception as e:
+            logger.error(f"Error in test_market_data: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+    def marketDataType(self, reqId, marketDataType):
+        """
+        Handle market data type changes from IB
+        
+        Args:
+            reqId (int): Request ID
+            marketDataType (int): Market data type (1=Live, 2=Frozen, 3=Delayed, 4=Delayed Frozen)
+        """
+        logger.info(f"Market data type changed to {marketDataType} for reqId {reqId}")
+        
+        # Store in session state for UI access
+        if 'market_data_types' not in st.session_state:
+            st.session_state.market_data_types = {}
+        st.session_state.market_data_types[reqId] = marketDataType
+        
+        # Record in class-level attribute too
+        self.market_data_type = marketDataType
+        
+    async def stream_data_async(self, symbol, exchange='SMART', currency='USD'):
+        """
+        Async version of stream_data for use with asyncio
+        
+        Args:
+            symbol (str): Trading symbol
+            exchange (str): Exchange name
+            currency (str): Currency
+            
+        Returns:
+            IB.Ticker: Ticker object with real-time data
+        """
+        logger.info(f"Starting data stream for {symbol} on exchange {exchange} [ASYNC]")
+        
+        try:
+            # Ensure we have a valid event loop
+            loop = ensure_event_loop()
+            
+            # Ensure connected asynchronously
+            await self.connect_async()
+            
+            # Define a unique key for this data stream
+            key = f"{symbol}.{exchange}.{currency}"
+            
+            # Check if we already have this stream
+            if key in self.data_streams:
+                logger.info(f"Using existing data stream for {key}")
+                return self.data_streams[key]
+            
+            # Create contract definition
+            contract = Stock(symbol, exchange, currency)
+            logger.info(f"Created contract {contract}")
+            
+            # Try different market data types to see what works
+            # Try LIVE (1) first, then DELAYED (3) as fallback
+            for market_data_type in [1, 3]:
+                try:
+                    # Set market data type using a thread since reqMarketDataType isn't a coroutine
+                    await asyncio.to_thread(self.ib.reqMarketDataType, market_data_type)
+                    logger.info(f"Requested market data type {market_data_type} [ASYNC]")
+                    
+                    # Expanded tick list for comprehensive data
+                    generic_tick_list = '100,101,105,106,165,221,225,233,236,258,411'
+                    
+                    # Request market data (run in thread since reqMktData isn't a coroutine)
+                    ticker = await asyncio.to_thread(
+                        self.ib.reqMktData,
+                        contract, 
+                        genericTickList=generic_tick_list, 
+                        snapshot=False, 
+                        regulatorySnapshot=False
+                    )
+                    logger.info(f"Ticker created for {symbol}, contract ID: {ticker.contract.conId} [ASYNC]")
+                    
+                    # Wait a little bit to see if we receive any data
+                    for i in range(5):  # Try for up to 5 seconds
+                        await asyncio.sleep(1)
+                        if ticker.last or ticker.bid or ticker.ask:
+                            logger.info(f"Received initial market data for {symbol} after {i+1} seconds [ASYNC]")
+                            break
+                    
+                    # Store the ticker
+                    self.data_streams[key] = ticker
+                    
+                    # Define an async-compatible ticker update handler
+                    def on_ticker_update(ticker):
+                        try:
+                            # Log what we received from ticker with detailed info
+                            price = ticker.marketPrice()
+                            logger.info(f"ASYNC UPDATE - {symbol}: marketPrice={price}, last={ticker.last}, bid={ticker.bid}, ask={ticker.ask}, volume={ticker.volume}")
+                            
+                            # Data validation check
+                            if not (ticker.bid or ticker.ask or ticker.last):
+                                logger.warning(f"Partial data received: {ticker}")
+                                # Try switching market data type
+                                asyncio.create_task(self.toggle_market_data_type(ticker))
+                                return
+                            
+                            # Check if we have any valid data to use
+                            if price > 0 or ticker.last > 0 or (ticker.bid > 0 and ticker.ask > 0):
+                                # Create a dict with current ticker data
+                                current_data = {
+                                    'symbol': symbol,
+                                    'timestamp': datetime.now(),
+                                    'bid': ticker.bid,
+                                    'ask': ticker.ask,
+                                    'last': ticker.last if ticker.last > 0 else price,
+                                    'close': ticker.close,
+                                    'open': ticker.open,
+                                    'high': ticker.high,
+                                    'low': ticker.low,
+                                    'volume': ticker.volume,
+                                    'bid_size': ticker.bidSize,
+                                    'ask_size': ticker.askSize
+                                }
+                                
+                                # Store in thread-safe way - don't directly access session_state
+                                key_name = f"{symbol}_data"
+                                with self.lock:
+                                    self.ticker_data_updates[key_name] = current_data
+                                    self.pending_updates = True
+                                
+                                # Update 1-minute bars if needed
+                                self._update_1m_bars(symbol, current_data)
+                                
+                                # Call user callback if provided
+                                cb = self.ticker_callbacks.get(key)
+                                if cb:
+                                    cb(ticker, current_data)
+                            else:
+                                logger.warning(f"Received ticker update with no valid price data for {symbol}")
+                        except Exception as e:
+                            logger.error(f"Error in async ticker update handler: {str(e)}")
+                            import traceback
+                            traceback.print_exc()
+                    
+                    # Register the update handler
+                    ticker.updateEvent += on_ticker_update
+                    logger.info(f"Started streaming {symbol} from {exchange} [ASYNC]")
+                    
+                    return ticker
+                
+                except Exception as e:
+                    logger.warning(f"Failed to get data with market data type {market_data_type} [ASYNC]: {str(e)}")
+            
+            # If we tried all market data types and none worked, raise an exception
+            raise Exception(f"Could not start data stream for {symbol} with any market data type")
+            
+        except Exception as e:
+            logger.error(f"Error in async stream_data: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            raise e
+            
+    async def toggle_market_data_type(self, ticker):
+        """Toggle between LIVE and DELAYED market data types"""
+        try:
+            current_type = getattr(self, 'market_data_type', 1)
+            new_type = 3 if current_type == 1 else 1  # Toggle between LIVE and DELAYED
+            logger.info(f"Switching market data type from {current_type} to {new_type} [ASYNC]")
+            
+            # Set the new market data type
+            await asyncio.to_thread(self.ib.reqMarketDataType, new_type)
+            
+            # Update our stored value
+            self.market_data_type = new_type
+            
+            # Re-request data on the ticker
+            generic_tick_list = '100,101,105,106,165,221,225,233,236,258,411'
+            await asyncio.to_thread(
+                self.ib.reqMktData,
+                ticker.contract, 
+                genericTickList=generic_tick_list, 
+                snapshot=False, 
+                regulatorySnapshot=False
+            )
+            logger.info(f"Re-requested market data with type {new_type} [ASYNC]")
+        except Exception as e:
+            logger.error(f"Error toggling market data type: {str(e)}")
+            import traceback
+            traceback.print_exc()
+    
+    def stream_data(self, symbol, exchange='SMART', currency='USD'):
+        """
+        Stream real-time market data for the given symbol
+        
+        Args:
+            symbol (str): Trading symbol
+            exchange (str): Exchange name
+            currency (str): Currency
+            
+        Returns:
+            IB.Ticker: Ticker object with real-time data
+        """
+        logger.info(f"Starting data stream for {symbol} on exchange {exchange}")
+        
+        try:
+            self.ensure_connected()
+            
+            # Define a unique key for this data stream
+            key = f"{symbol}.{exchange}.{currency}"
+            
+            # Check if we already have this stream
+            if key in self.data_streams:
+                logger.info(f"Using existing data stream for {key}")
+                return self.data_streams[key]
+            
+            # Create contract definition
+            contract = Stock(symbol, exchange, currency)
+            logger.info(f"Created contract {contract}")
+            
+            # Try different market data types to see what works
+            # Try LIVE (1) first, then DELAYED (3) as fallback
+            for market_data_type in [1, 3]:
+                try:
+                    self.ib.reqMarketDataType(market_data_type)
+                    logger.info(f"Requested market data type {market_data_type}")
+                    
+                    # Request market data with comprehensive tick types
+                    # Expanded tick list for more complete data
+                    generic_tick_list = '100,101,105,106,165,221,225,233,236,258,411'
+                    
+                    # Request market data with specific parameters
+                    ticker = self.ib.reqMktData(contract, genericTickList=generic_tick_list, snapshot=False, regulatorySnapshot=False)
+                    logger.info(f"Ticker created for {symbol}, contract ID: {ticker.contract.conId}")
+                    
+                    # Wait a little bit to see if we receive any data
+                    for i in range(5):  # Try for up to 5 seconds
+                        self.ib.sleep(1)
+                        if ticker.last or ticker.bid or ticker.ask:
+                            logger.info(f"Received initial market data for {symbol} after {i+1} seconds")
+                            break
+                    
+                    # Store the ticker even if no data received yet
+                    self.data_streams[key] = ticker
+                    logger.info(f"Market data requested for {symbol}, ticker ID: {ticker.contract.conId}")
+                    
+                    # Define an improved ticker update handler with retry logic
+                    def on_ticker_update(ticker):
+                        try:
+                            # Log what we received from ticker with detailed info
+                            price = ticker.marketPrice()
+                            # Add more detailed logging for troubleshooting
+                            logger.info(f"[TICKER UPDATE] {symbol}: marketPrice={price}, last={ticker.last}, bid={ticker.bid}, ask={ticker.ask}, volume={ticker.volume}")
+                            # Print to stdout for immediate visibility
+                            print(f"[TICKER UPDATE] {symbol}: Last={ticker.last}, Bid={ticker.bid}, Ask={ticker.ask}, Vol={ticker.volume}")
+                            
+                            # Data validation check
+                            if not (ticker.bid or ticker.ask or ticker.last):
+                                logger.warning(f"Partial data received: {ticker}")
+                                # Try a different market data type
+                                current_type = getattr(self.ib, 'marketDataType', 1)
+                                new_type = 3 if current_type == 1 else 1  # Toggle between LIVE and DELAYED
+                                logger.info(f"Switching market data type from {current_type} to {new_type}")
+                                self.ib.reqMarketDataType(new_type)
+                                # Re-request data
+                                self.ib.reqMktData(ticker.contract, genericTickList=generic_tick_list, snapshot=False, regulatorySnapshot=False)
+                                return
+                            
+                            # Check if we have any valid data to use
+                            if price > 0 or ticker.last > 0 or (ticker.bid > 0 and ticker.ask > 0):
+                                # Create a dict with current ticker data
+                                current_data = {
+                                    'symbol': symbol,
+                                    'timestamp': datetime.now(),
+                                    'bid': ticker.bid,
+                                    'ask': ticker.ask,
+                                    'last': ticker.last if ticker.last > 0 else price,
+                                    'close': ticker.close,
+                                    'open': ticker.open,
+                                    'high': ticker.high,
+                                    'low': ticker.low,
+                                    'volume': ticker.volume,
+                                    'bid_size': ticker.bidSize,
+                                    'ask_size': ticker.askSize
+                                }
+                                
+                                # Log the received data
+                                logger.info(f"Processed data for {symbol}: {current_data}")
+                                
+                                # Store in a thread-safe way - don't access session_state directly
+                                # Instead, store in our instance variables and let the main thread sync
+                                key_name = f"{symbol}_data"
+                                self.ticker_data_updates[key_name] = current_data
+                                self.pending_updates = True
+                                
+                                # Update 1-minute bars if needed
+                                self._update_1m_bars(symbol, current_data)
+                                
+                                # Call user callback if provided
+                                cb = self.ticker_callbacks.get(key)
+                                if cb:
+                                    cb(ticker, current_data)
+                            else:
+                                logger.warning(f"Received ticker update with no valid price data for {symbol}")
+                        except Exception as e:
+                            logger.error(f"Error in ticker update handler: {str(e)}")
+                            import traceback
+                            traceback.print_exc()
+                    
+                    # Register the update handler
+                    ticker.updateEvent += on_ticker_update
+                    logger.info(f"Started streaming {symbol} from {exchange}")
+                    
+                    return ticker
+                
+                except Exception as e:
+                    logger.warning(f"Failed to get data with market data type {market_data_type}: {str(e)}")
+                    # If we try both market data types and both fail, we'll fall through to the final exception handler
+            
+            # If we tried all market data types and none worked, raise an exception
+            raise Exception(f"Could not start data stream for {symbol} with any market data type")
+            
+        except Exception as e:
+            logger.error(f"Error in stream_data: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            raise e
+    
+    def _update_1m_bars(self, symbol, tick_data):
+        """
+        Update 1-minute bars from tick data
+        
+        Args:
+            symbol (str): Trading symbol
+            tick_data (dict): Current tick data
+        """
+        current_time = tick_data['timestamp']
+        current_minute = current_time.replace(second=0, microsecond=0)
+        
+        if symbol not in self.last_1m_bar:
+            # Initialize bar for this symbol
+            self.last_1m_bar[symbol] = {
+                'minute': current_minute,
+                'open': tick_data['last'],
+                'high': tick_data['last'],
+                'low': tick_data['last'],
+                'close': tick_data['last'],
+                'volume': tick_data['volume']
+            }
+        else:
+            last_bar = self.last_1m_bar[symbol]
+            
+            # If we're in a new minute, store the completed bar and start a new one
+            if current_minute > last_bar['minute']:
+                # Store completed bar in history
+                if symbol not in self.history_data:
+                    self.history_data[symbol] = []
+                
+                self.history_data[symbol].append({
+                    'timestamp': last_bar['minute'],
+                    'open': last_bar['open'],
+                    'high': last_bar['high'],
+                    'low': last_bar['low'],
+                    'close': last_bar['close'],
+                    'volume': last_bar['volume']
+                })
+                
+                # Keep only the most recent 1000 bars
+                if len(self.history_data[symbol]) > 1000:
+                    self.history_data[symbol] = self.history_data[symbol][-1000:]
+                
+                # Start a new bar
+                self.last_1m_bar[symbol] = {
+                    'minute': current_minute,
+                    'open': tick_data['last'],
+                    'high': tick_data['last'],
+                    'low': tick_data['last'],
+                    'close': tick_data['last'],
+                    'volume': tick_data['volume'] - last_bar['volume']  # Reset volume count
+                }
+            else:
+                # Update current bar
+                self.last_1m_bar[symbol]['high'] = max(last_bar['high'], tick_data['last'])
+                self.last_1m_bar[symbol]['low'] = min(last_bar['low'], tick_data['last'])
+                self.last_1m_bar[symbol]['close'] = tick_data['last']
+                self.last_1m_bar[symbol]['volume'] = tick_data['volume'] - (last_bar['volume'] - self.last_1m_bar[symbol]['volume'])
+    
+    def get_historical_data(self, symbol, exchange='SMART', currency='USD', 
+                            duration='1 D', bar_size='1 min', what_to_show='TRADES'):
+        """
+        Get historical data for a symbol
+        
+        Args:
+            symbol (str): Trading symbol
+            exchange (str): Exchange name (default: SMART)
+            currency (str): Currency (default: USD)
+            duration (str): Time duration (e.g., '1 D', '1 W')
+            bar_size (str): Bar size (e.g., '1 min', '1 hour')
+            what_to_show (str): Data type (e.g., 'TRADES', 'BID', 'ASK')
+            
+        Returns:
+            pd.DataFrame: Historical data
+        """
+        self.ensure_connected()
+        
+        # Create contract
+        contract = Stock(symbol, exchange, currency)
+        
+        # Request historical data
+        bars = self.ib.reqHistoricalData(
+            contract=contract,
+            endDateTime='',
+            durationStr=duration,
+            barSizeSetting=bar_size,
+            whatToShow=what_to_show,
+            useRTH=True,
+            formatDate=1
+        )
+        
+        # Convert to DataFrame
+        if bars:
+            df = util.df(bars)
+            
+            # Ensure correct column names
+            if 'date' in df.columns:
+                df = df.rename(columns={'date': 'timestamp'})
+            
+            # Set timestamp as index
+            if 'timestamp' in df.columns:
+                df = df.set_index('timestamp')
+            
+            # Lowercase column names for consistency
+            df.columns = [col.lower() for col in df.columns]
+            
+            return df
+        
+        return pd.DataFrame()  # Empty DataFrame if no data
+
+    def get_ohlcv_dataframe(self, symbol):
+        """
+        Get OHLCV DataFrame from accumulated 1-minute bars
+        
+        Args:
+            symbol (str): Trading symbol
+            
+        Returns:
+            pd.DataFrame: OHLCV data
+        """
+        if symbol in self.history_data and self.history_data[symbol]:
+            df = pd.DataFrame(self.history_data[symbol])
+            df = df.set_index('timestamp')
+            return df
+        
+        return pd.DataFrame()  # Empty DataFrame if no data
+        
+    def stop_streaming(self, symbol, exchange='SMART', currency='USD'):
+        """
+        Stop streaming for a specific symbol
+        
+        Args:
+            symbol (str): Trading symbol
+            exchange (str): Exchange name (default: SMART)
+            currency (str): Currency (default: USD)
+        """
+        key = f"{symbol}:{exchange}:{currency}"
+        
+        with self.lock:
+            if key in self.data_streams:
+                ticker = self.data_streams[key]
+                self.ib.cancelMktData(ticker.contract)
+                if key in self.ticker_callbacks:
+                    del self.ticker_callbacks[key]
+                del self.data_streams[key]
+                logger.info(f"Stopped streaming {symbol} from {exchange}")
+                
+    def run_one_iteration(self, timeout=0.1):
+        """
+        Run one iteration of the IB event loop
+        
+        Args:
+            timeout (float): Maximum time to wait for events
+        """
+        if self.connected:
+            try:
+                self.ib.sleep(timeout)
+            except Exception as e:
+                logger.error(f"Error in IB event loop: {str(e)}")
+                self.ensure_connected()
+                
+    def run_forever(self):
+        """
+        Run the IB event loop forever with automatic reconnection
+        """
+        while True:
+            try:
+                if not self.connected or not self.ib.isConnected():
+                    self.ensure_connected()
+                    if not self.connected:
+                        time.sleep(self.reconnect_interval)
+                        continue
+                
+                self.ib.sleep(1)  # Process events for 1 second
+            except KeyboardInterrupt:
+                logger.info("IB client loop interrupted")
+                break
+            except Exception as e:
+                logger.error(f"Error in IB event loop: {str(e)}")
+                time.sleep(self.reconnect_interval) 
+
+    def on_tick_update(self, ticker):
+        """
+        Callback for ticker updates
+        
+        Args:
+            ticker: Updated ticker object
+        """
+        try:
+            logger.info(f"Tick update received for {ticker.contract.symbol}")
+            
+            # Get the symbol from the ticker's contract
+            symbol = ticker.contract.symbol
+            
+            # Check if we have the symbol key
+            if symbol not in self.ticker_callbacks:
+                logger.info(f"No callback registered for {symbol}")
+                return
+            
+            # Get the callback
+            callback = self.ticker_callbacks[symbol]
+            
+            # Check if we have a valid callback
+            if callback is None:
+                logger.info(f"Callback is None for {symbol}")
+                return
+            
+            # Extract data from ticker
+            current_data = {
+                'symbol': symbol,
+                'timestamp': datetime.now(),
+                'bid': ticker.bid,
+                'ask': ticker.ask,
+                'last': ticker.last,
+                'close': ticker.close,
+                'open': ticker.open,
+                'high': ticker.high,
+                'low': ticker.low,
+                'volume': ticker.volume,
+                'bid_size': ticker.bidSize,
+                'ask_size': ticker.askSize
+            }
+            
+            # Print data values to help debug
+            logger.info(f"Ticker data for {symbol}: last={ticker.last}, bid={ticker.bid}, ask={ticker.ask}, volume={ticker.volume}")
+            
+            # Call the callback with the updated data
+            callback(ticker, current_data)
+            logger.info(f"Called callback for {symbol}")
+            
+            # Update OHLCV data if we have a last price and it's changed
+            if ticker.last and (self.last_prices.get(symbol) != ticker.last):
+                logger.info(f"Price changed for {symbol} from {self.last_prices.get(symbol)} to {ticker.last}")
+                self.last_prices[symbol] = ticker.last
+                
+                # Update 1-minute bars
+                self._update_1m_bars(symbol, current_data)
+            
+            # Create a real-time trade bar if volume changes
+            # This helps capture intraday changes even without 1-minute aggregation
+            if ticker.volume and ticker.volume != self.last_volumes.get(symbol, 0):
+                volume_change = ticker.volume - self.last_volumes.get(symbol, 0)
+                if volume_change > 0:
+                    logger.info(f"Volume changed for {symbol} - detected trade of {volume_change} shares")
+                    self.last_volumes[symbol] = ticker.volume
+        except Exception as e:
+            logger.error(f"Error in on_tick_update: {str(e)}")
+            import traceback
+            traceback.print_exc() 
+
+    def handle_time_offset(self):
+        """
+        Handle time synchronization issues between client and server.
+        This ensures the client is using the correct time delta for data requests.
+        """
+        try:
+            logger.info("Checking time synchronization...")
+            
+            # Create a request without any specific contract, just to get the server time
+            req = self.ib.reqCurrentTime()
+            
+            # Calculate the time difference
+            local_time = datetime.now()
+            server_time = datetime.fromtimestamp(req)
+            time_diff = (server_time - local_time).total_seconds()
+            
+            logger.info(f"Time difference between local and server: {time_diff:.2f} seconds")
+            
+            # Store the time difference for future reference
+            self.time_offset = time_diff
+            
+            return time_diff
+        except Exception as e:
+            logger.error(f"Error checking time synchronization: {str(e)}")
+            return 0 
+
+    def sync_to_streamlit(self):
+        """
+        Synchronize data from background thread to session_state.
+        Call this from the main Streamlit thread.
+        """
+        try:
+            import streamlit as st
+            
+            # Safely copy any pending updates to session_state
+            with self.lock:
+                if hasattr(self, 'pending_updates') and self.pending_updates:
+                    for key, value in self.ticker_data_updates.items():
+                        st.session_state[key] = value
+                    # Clear the updates after syncing
+                    self.ticker_data_updates = {}
+                    self.pending_updates = False
+                    # Flag for UI refresh
+                    st.session_state.last_ui_update = time.time()
+                    st.session_state.pending_update = True
+                    logger.info("Synced ticker data updates to Streamlit session_state")
+                
+            # Process any results from background tasks
+            try:
+                from app.asyncio_patch import get_background_results
+            except ImportError:
+                from asyncio_patch import get_background_results
+                
+            results = get_background_results()
+            if results:
+                for task_id, result, error in results:
+                    if error:
+                        logger.error(f"Background task {task_id} failed: {error}")
+                    else:
+                        logger.debug(f"Background task {task_id} completed successfully")
+        except Exception as e:
+            logger.error(f"Error in sync_to_streamlit: {str(e)}")
+            import traceback
+            traceback.print_exc() 
